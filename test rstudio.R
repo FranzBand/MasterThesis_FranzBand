@@ -6,3 +6,5 @@ c <- a +b
 print(c)
 
 print("Hello")
+
+cat("This is the test", c)
