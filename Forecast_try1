@@ -1,0 +1,72 @@
+library(dplyr)
+library(ggplot2)
+
+# ============================================================
+# FORECASTING (2017-2022)
+# ============================================================
+df_forecast <- df_est %>%
+  filter(year >= 2017, year <= 2022)
+
+# Step 1 prediction - USE YOUR EXISTING y_hat or create it
+if("y_hat" %in% names(df_forecast)) {
+  df_forecast$lnlhat <- df_forecast$y_hat
+} else {
+  stop("No 'y_hat' column found in df_forecast. Need Step 1 prediction.")
+}
+
+# Step 2 prediction
+df_forecast$u2hat <- predict(step2, newdata = df_forecast)
+
+# Combined log forecast
+df_forecast$lnl_forecast <- df_forecast$lnlhat + df_forecast$u2hat
+
+# ============================================================
+# CI/PI CONSTRUCTION
+# ============================================================
+X_train <- model.matrix(step2)
+X_new   <- model.matrix(formula(step2), data = df_forecast)
+
+XtXi <- solve(t(X_train) %*% X_train)
+lev  <- rowSums((X_new %*% XtXi) * X_new)
+
+sigma_hat <- summary(step2)$sigma
+t_crit    <- qt(0.975, df.residual(step2))
+
+PI_half <- t_crit * sigma_hat * sqrt(1 + lev)
+CI_half <- t_crit * sigma_hat * sqrt(lev)
+
+df_forecast$lnl_lwr_PI <- df_forecast$lnl_forecast - PI_half
+df_forecast$lnl_upr_PI <- df_forecast$lnl_forecast + PI_half
+df_forecast$lnl_lwr_CI <- df_forecast$lnl_forecast - CI_half
+df_forecast$lnl_upr_CI <- df_forecast$lnl_forecast + CI_half
+
+# ============================================================
+# BACK-TRANSFORM TO LEVELS
+# ============================================================
+u_tilde <- residuals(step2)
+delta0  <- exp(mean(u_tilde) + var(u_tilde)/2)
+
+df_forecast$Lhat        <- delta0 * exp(df_forecast$lnl_forecast)
+df_forecast$Lhat_lwr_PI <- delta0 * exp(df_forecast$lnl_lwr_PI)
+df_forecast$Lhat_upr_PI <- delta0 * exp(df_forecast$lnl_upr_PI)
+df_forecast$Lhat_lwr_CI <- delta0 * exp(df_forecast$lnl_lwr_CI)
+df_forecast$Lhat_upr_CI <- delta0 * exp(df_forecast$lnl_upr_CI)
+
+# ============================================================
+# AGGREGATE AND PLOT
+# ============================================================
+df_segment <- df_forecast %>%
+  group_by(year, segment) %>%
+  summarise(across(starts_with("Lhat"), sum, na.rm = TRUE), .groups = "drop")
+
+p <- ggplot(df_segment, aes(x = year)) +
+  geom_ribbon(aes(ymin = Lhat_lwr_PI, ymax = Lhat_upr_PI, fill = "95% PI"), alpha = 0.2) +
+  geom_ribbon(aes(ymin = Lhat_lwr_CI, ymax = Lhat_upr_CI, fill = "95% CI"), alpha = 0.4) +
+  geom_line(aes(y = Lhat), color = "steelblue", linewidth = 1) +
+  facet_wrap(~ segment, scales = "free_y") +
+  scale_fill_manual(values = c("95% PI" = "lightblue", "95% CI" = "steelblue")) +
+  labs(title = "Forecasted Employment by Segment", x = "Year", y = "Employment") +
+  theme_minimal()
+
+print(p)
+ggsave("forecast.pdf", width = 16, height = 20)
