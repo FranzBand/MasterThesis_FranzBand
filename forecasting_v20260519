@@ -1,0 +1,131 @@
+library(dplyr)
+library(ggplot2)
+
+# ============================================================
+# USER INPUT — change this to your actual employment variable
+# ============================================================
+# Run names(df_est) and find the column with raw employment counts
+# e.g. "L", "emp", "employment", "werkgelegenheid", etc.
+
+employment_var <- "L"   # <-- CHANGE THIS
+
+# ============================================================
+# STEP 0 — Create log employment level and split samples
+# ============================================================
+df_est <- df_est %>%
+  mutate(lnl = log(.data[[employment_var]]))
+
+df_train  <- df_est %>% filter(year <= 2016)
+df_future <- df_est %>% filter(year >= 2017, year <= 2022)
+
+# ============================================================
+# STEP 1 — Fit Step 1 on training data
+# ============================================================
+step1 <- lm(
+  lnl ~ dlnva + factor(sector):dlnva +
+        dlnk  + factor(sector):dlnk,
+  data = df_train,
+  na.action = na.exclude
+)
+
+# Store Step 1 fitted values and residuals in training data
+df_train$yhat1   <- fitted(step1)
+df_train$error_y <- residuals(step1)
+
+# ============================================================
+# STEP 2 — Fit Step 2 on training data
+# ============================================================
+step2 <- lm(
+  error_y ~ error_va + factor(sector):error_va +
+            error_k  + factor(sector):error_k,
+  data = df_train,
+  na.action = na.exclude
+)
+
+# ============================================================
+# STEP 3 — Forecast 2017–2022
+# ============================================================
+df_future$yhat1   <- predict(step1, newdata = df_future)
+df_future$uhat2   <- predict(step2, newdata = df_future)
+df_future$lnlhat  <- df_future$yhat1 + df_future$uhat2
+
+# ============================================================
+# STEP 4 — CI and PI on log scale
+# ============================================================
+X0_train <- model.matrix(step2)
+X0_new   <- model.matrix(update(formula(step2), NULL ~ .), data = df_future)
+
+XtXi    <- solve(t(X0_train) %*% X0_train)
+lev_new <- rowSums((X0_new %*% XtXi) * X0_new)
+
+sigma_hat <- summary(step2)$sigma
+t_crit    <- qt(0.975, df = step2$df.residual)
+
+PI_half <- t_crit * sigma_hat * sqrt(1 + lev_new)
+CI_half <- t_crit * sigma_hat * sqrt(lev_new)
+
+df_future$lnlhat_lwr_PI <- df_future$lnlhat - PI_half
+df_future$lnlhat_upr_PI <- df_future$lnlhat + PI_half
+df_future$lnlhat_lwr_CI <- df_future$lnlhat - CI_half
+df_future$lnlhat_upr_CI <- df_future$lnlhat + CI_half
+
+# ============================================================
+# STEP 5 — Jensen correction and back-transform to levels
+# ============================================================
+u_tilde <- residuals(step2)
+delta0  <- exp(mean(u_tilde, na.rm = TRUE) + var(u_tilde, na.rm = TRUE) / 2)
+
+df_future$Lhat        <- delta0 * exp(df_future$lnlhat)
+df_future$Lhat_lwr_PI <- delta0 * exp(df_future$lnlhat_lwr_PI)
+df_future$Lhat_upr_PI <- delta0 * exp(df_future$lnlhat_upr_PI)
+df_future$Lhat_lwr_CI <- delta0 * exp(df_future$lnlhat_lwr_CI)
+df_future$Lhat_upr_CI <- delta0 * exp(df_future$lnlhat_upr_CI)
+
+# Quick sanity check
+cat("delta0 =", delta0, "\n")
+cat("Lhat range:", range(df_future$Lhat, na.rm = TRUE), "\n")
+cat("lnlhat range:", range(df_future$lnlhat, na.rm = TRUE), "\n")
+
+# ============================================================
+# STEP 6 — Aggregate by year and segment
+# ============================================================
+df_segment <- df_future %>%
+  mutate(year = as.integer(year)) %>%
+  group_by(year, segment) %>%
+  summarise(
+    total_Lhat        = sum(Lhat,        na.rm = TRUE),
+    total_Lhat_lwr_PI = sum(Lhat_lwr_PI, na.rm = TRUE),
+    total_Lhat_upr_PI = sum(Lhat_upr_PI, na.rm = TRUE),
+    total_Lhat_lwr_CI = sum(Lhat_lwr_CI, na.rm = TRUE),
+    total_Lhat_upr_CI = sum(Lhat_upr_CI, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ============================================================
+# STEP 7 — Plot
+# ============================================================
+p <- ggplot(df_segment, aes(x = year)) +
+  geom_ribbon(
+    aes(ymin = total_Lhat_lwr_PI, ymax = total_Lhat_upr_PI, fill = "95% PI"),
+    alpha = 0.20
+  ) +
+  geom_ribbon(
+    aes(ymin = total_Lhat_lwr_CI, ymax = total_Lhat_upr_CI, fill = "95% CI"),
+    alpha = 0.40
+  ) +
+  geom_line(aes(y = total_Lhat), color = "steelblue", linewidth = 1) +
+  geom_point(aes(y = total_Lhat), color = "steelblue", size = 2) +
+  facet_wrap(~ segment, scales = "free_y") +
+  scale_x_continuous(breaks = 2017:2022) +
+  scale_fill_manual(values = c("95% PI" = "lightblue", "95% CI" = "steelblue")) +
+  labs(
+    title = "Forecasted Employment by Segment (2017–2022)",
+    x     = "Year",
+    y     = "Employment",
+    fill  = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p)
+ggsave("segments_forecast_CI_PI.pdf", plot = p, width = 16, height = 20)
