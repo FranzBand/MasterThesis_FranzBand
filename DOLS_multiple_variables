@@ -1,0 +1,71 @@
+# --- Multivariate DOLS: log_va ~ log_empl + log_investment
+y  <- sub$log_va
+x1 <- sub$log_empl
+x2 <- sub$log_investment
+
+valid <- is.finite(y) & is.finite(x1) & is.finite(x2) &
+         y != 0 & x1 != 0 & x2 != 0
+y  <- y[valid];  x1 <- x1[valid];  x2 <- x2[valid]
+
+if (length(y) >= 5 && sd(y) > 1e-10 && sd(x1) > 1e-10 && sd(x2) > 1e-10) {
+  tryCatch({
+    n  <- length(y)
+    k  <- ifelse(n <= 150, 2, 3)
+    tr <- k + 2
+
+    dx1 <- diff(x1);  dx2 <- diff(x2)
+
+    # Build lead/lag columns for BOTH regressors
+    ll <- list()
+    for (j in -k:k) {
+      s1 <- rep(NA, n);  s2 <- rep(NA, n)
+      if (j <= 0) {
+        idx <- (1 - j):(n - 1)
+        s1[idx] <- dx1[1:length(idx)]
+        s2[idx] <- dx2[1:length(idx)]
+      } else {
+        idx <- 1:(n - j - 1)
+        s1[idx] <- dx1[(j+1):(j+length(idx))]
+        s2[idx] <- dx2[(j+1):(j+length(idx))]
+      }
+      ll[[paste0("dx1_", j)]] <- s1
+      ll[[paste0("dx2_", j)]] <- s2
+    }
+    ll_mat <- do.call(cbind, ll)
+
+    y_t  <- y[(tr+1):(n-tr)]
+    x1_t <- x1[(tr+1):(n-tr)]
+    x2_t <- x2[(tr+1):(n-tr)]
+    ll_t <- ll_mat[(tr+1):(n-tr), ]
+
+    X_mat <- cbind(1, x1_t, x2_t, ll_t)
+    fit   <- lm(y_t ~ X_mat - 1)
+    res   <- residuals(fit)
+    coefs <- coef(fit)
+
+    # beta_L = position 2, beta_K = position 3
+    adf_mv <- tryCatch(
+      ur.df(res, type = "none", selectlags = "AIC")@teststat[1],
+      error = function(e) NA
+    )
+
+    all_results[[length(all_results) + 1]] <- data.frame(
+      sector_num    = occ_num,
+      sector_name   = occ_name,
+      segment       = occ_seg,
+      class         = occ_cls,
+      year_start    = year_start,
+      quarter_start = quarter_start,
+      year_end      = year_end,
+      quarter_end   = quarter_end,
+      n_obs         = length(y_t),
+      pair          = "logVA ~ logL + logK",
+      dols_beta     = round(coefs[2], 4),   # labour elasticity
+      dols_beta2    = round(coefs[3], 4),   # capital elasticity
+      dols_adf_resid = round(adf_mv, 4),
+      dols_coint    = ifelse(!is.na(adf_mv) & adf_mv < CV_5, "YES (5%)", "NO")
+    )
+  }, error = function(e) {
+    message(paste0("Grp ", i, " | Cobb-Douglas | ", e$message))
+  })
+}
