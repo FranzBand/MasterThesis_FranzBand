@@ -1,0 +1,398 @@
+# ============================================================
+#  DOLS — Stock & Watson (1993) Full Implementation
+#  Variables: employment, investments (quarterly), gdp (quarterly)
+#  Grouping: sector_num, sector (name), segment, class
+# ============================================================
+
+library(urca)
+library(tseries)
+
+# ------------------------------------------------------------
+# 1. LOAD & PREPARE DATA
+# ------------------------------------------------------------
+data <- read.csv("data.csv")
+
+# Remove rows where any key variable is zero (no data recorded)
+data <- subset(data, employment > 0 & investments > 0 & gdp > 0)
+
+# Log-transform
+data$log_empl       <- log(data$employment)
+data$log_investment <- log(data$investments)
+data$log_va         <- log(data$gdp)
+
+# Time index
+data$time <- data$year + (data$quarter - 1) / 4
+
+cat("Rows after cleaning:", nrow(data), "\n")
+cat("Columns:", paste(colnames(data), collapse = ", "), "\n")
+
+# ------------------------------------------------------------
+# 2. DEFINE UNIQUE OCCUPATION GROUPS
+#    Each unique combination of sector_num + segment + class
+# ------------------------------------------------------------
+occ_groups <- unique(data[, c("sector_num", "sector", "segment", "class")])
+occ_groups <- occ_groups[order(occ_groups$sector_num, occ_groups$class), ]
+cat("Total unique groups:", nrow(occ_groups), "\n")
+
+# ------------------------------------------------------------
+# 3. HELPER: AR SPECTRAL ESTIMATOR of long-run variance
+#    Stock & Watson (1993) DOLS2 — preferred over Bartlett kernel
+# ------------------------------------------------------------
+ar_lrv <- function(resid, ar_order = NULL) {
+  n <- length(resid)
+  if (is.null(ar_order)) ar_order <- ifelse(n <= 150, 2, 3)
+
+  ar_fit <- ar(resid, order.max = ar_order, method = "ols", aic = FALSE)
+  sigma2 <- ar_fit$var.pred
+  phi    <- ar_fit$ar
+
+  lrv <- sigma2 / (1 - sum(phi))^2
+  return(lrv)
+}
+
+# ------------------------------------------------------------
+# 4. HELPER: DOLS — Stock & Watson (1993)
+#    y = alpha + beta*x + sum_{j=-k}^{k} d_j*Δx_{t-j} + v_t
+#    Long-run variance via AR spectral estimator (DOLS2)
+#    k = 2 for T<=150, k = 3 for T>150 (SW Table I)
+# ------------------------------------------------------------
+dols_SW1993 <- function(y, x, k = NULL, ar_order = NULL, include_trend = FALSE) {
+  n <- length(y)
+  if (is.null(k))        k        <- ifelse(n <= 150, 2, 3)
+  if (is.null(ar_order)) ar_order <- ifelse(n <= 150, 2, 3)
+
+  dx <- diff(x)
+
+  # Build leads and lags of Δx
+  ll_cols <- list()
+  for (j in -k:k) {
+    shifted <- rep(NA, n)
+    if (j <= 0) {
+      idx <- (1 - j):(n - 1)
+      shifted[idx] <- dx[1:length(idx)]
+    } else {
+      idx <- 1:(n - j - 1)
+      shifted[idx] <- dx[(j + 1):(j + length(idx))]
+    }
+    ll_cols[[paste0("d", j)]] <- shifted
+  }
+  ll_mat <- do.call(cbind, ll_cols)
+
+  # Trim rows (lose k+2 from each end)
+  trim <- k + 2
+  y_t  <- y[(trim + 1):(n - trim)]
+  x_t  <- x[(trim + 1):(n - trim)]
+  ll_t <- ll_mat[(trim + 1):(n - trim), ]
+
+  # Design matrix — position 2 is always beta (the x coefficient)
+  if (include_trend) {
+    X_mat <- cbind(1, x_t, 1:length(y_t), ll_t)
+    x_col <- 2   # intercept=1, x=2, trend=3, leads/lags=4+
+  } else {
+    X_mat <- cbind(1, x_t, ll_t)
+    x_col <- 2   # intercept=1, x=2, leads/lags=3+
+  }
+
+  fit   <- lm(y_t ~ X_mat - 1)
+  resid <- residuals(fit)
+  coefs <- coef(fit)
+
+  # Long-run covariance via AR spectral LRV
+  lrv    <- ar_lrv(resid, ar_order = ar_order)
+  V_DOLS <- lrv * solve(t(X_mat) %*% X_mat) * length(y_t)
+  se_all <- sqrt(diag(V_DOLS))
+
+  # Position-based extraction (avoids R naming inconsistencies)
+  beta   <- coefs[x_col]
+  se     <- se_all[x_col]
+  t_stat <- beta / se
+  wald   <- t_stat^2   # ~chi^2(1); critical value 3.84 at 5%
+
+  adf_t <- tryCatch(
+    ur.df(resid, type = "none", selectlags = "AIC")@teststat[1],
+    error = function(e) NA
+  )
+
+  return(list(
+    beta   = beta,
+    se     = se,
+    t_stat = t_stat,
+    wald   = wald,
+    adf_t  = adf_t,
+    resid  = resid,
+    k      = k,
+    T_reg  = length(y_t)
+  ))
+}
+
+# ------------------------------------------------------------
+# 5. HELPER: ENGLE-GRANGER two-step
+# ------------------------------------------------------------
+engle_granger <- function(y, x) {
+  fit   <- lm(y ~ x)
+  resid <- residuals(fit)
+  adf_t <- tryCatch(
+    ur.df(resid, type = "none", selectlags = "AIC")@teststat[1],
+    error = function(e) NA
+  )
+  return(list(coef = coef(fit)[2], adf_t = adf_t, resid = resid))
+}
+
+# ------------------------------------------------------------
+# 6. UNIT ROOT PRE-TESTS (ADF)
+#    SW (1993) use ADF tests — Section 7
+# ------------------------------------------------------------
+cat("\n===== UNIT ROOT PRE-TESTS =====\n")
+
+ur_results <- data.frame()
+
+for (i in 1:nrow(occ_groups)) {
+  occ_num  <- occ_groups$sector_num[i]
+  occ_name <- occ_groups$sector[i]
+  occ_seg  <- occ_groups$segment[i]
+  occ_cls  <- occ_groups$class[i]
+
+  sub <- subset(data, sector_num == occ_num &
+                      segment    == occ_seg  &
+                      class      == occ_cls)
+  sub <- sub[order(sub$time), ]
+  if (nrow(sub) < 5) next
+
+  for (vname in c("log_empl", "log_investment", "log_va")) {
+    series <- sub[[vname]]
+    if (any(is.na(series)) || length(series) < 5) next
+
+    adf_lev  <- tryCatch(
+      ur.df(series,       type = "drift", selectlags = "AIC")@teststat[1],
+      error = function(e) NA
+    )
+    adf_diff <- tryCatch(
+      ur.df(diff(series), type = "drift", selectlags = "AIC")@teststat[1],
+      error = function(e) NA
+    )
+
+    # ADF 5% critical value with drift ≈ -2.86
+    verdict <- ifelse(!is.na(adf_lev) & !is.na(adf_diff),
+                ifelse(adf_lev > -2.86 & adf_diff < -2.86, "I(1)", "Check manually"),
+                "NA")
+
+    ur_results <- rbind(ur_results, data.frame(
+      sector_num  = occ_num,
+      sector_name = occ_name,
+      segment     = occ_seg,
+      class       = occ_cls,
+      variable    = vname,
+      adf_level   = round(adf_lev,  3),
+      adf_diff    = round(adf_diff, 3),
+      verdict     = verdict
+    ))
+  }
+}
+
+print(ur_results)
+write.csv(ur_results, "unit_root_results.csv", row.names = FALSE)
+cat("Saved: unit_root_results.csv\n")
+
+# ------------------------------------------------------------
+# 7. DEFINE PAIRS AND CRITICAL VALUES
+# ------------------------------------------------------------
+CV_5  <- -3.41   # MacKinnon (1991), 1 regressor, 5%
+CV_10 <- -3.12   # MacKinnon (1991), 1 regressor, 10%
+k_val <- 2
+
+pairs <- list(
+  list(y = "log_va",         x = "log_investment", label = "logVA ~ logK"),
+  list(y = "log_va",         x = "log_empl",       label = "logVA ~ logL"),
+  list(y = "log_empl",       x = "log_investment", label = "logL ~ logK"),
+  list(y = "log_investment", x = "log_va",         label = "logK ~ logVA"),
+  list(y = "log_investment", x = "log_empl",       label = "logK ~ logL")
+)
+
+# ------------------------------------------------------------
+# 8. MAIN COINTEGRATION LOOP
+# ------------------------------------------------------------
+cat("\n===== COINTEGRATION LOOP =====\n")
+
+all_results <- list()
+
+for (i in 1:nrow(occ_groups)) {
+  occ_num  <- occ_groups$sector_num[i]
+  occ_name <- occ_groups$sector[i]
+  occ_seg  <- occ_groups$segment[i]
+  occ_cls  <- occ_groups$class[i]
+
+  sub <- subset(data, sector_num == occ_num &
+                      segment    == occ_seg  &
+                      class      == occ_cls)
+  sub <- sub[order(sub$time), ]
+  if ((nrow(sub) - 2 * (k_val + 2)) < 5) next
+
+  year_start    <- sub$year[1]
+  quarter_start <- sub$quarter[1]
+  year_end      <- sub$year[nrow(sub)]
+  quarter_end   <- sub$quarter[nrow(sub)]
+
+  # Helper: cointegration label
+  coint_label <- function(adf) {
+    ifelse(is.na(adf), "NA",
+    ifelse(adf < CV_5,  "YES (5%)",
+    ifelse(adf < CV_10, "YES (10%)", "NO")))
+  }
+
+  # ---- BIVARIATE PAIRS ----
+  for (p in pairs) {
+    y_raw <- sub[[p$y]]
+    x_raw <- sub[[p$x]]
+
+    valid <- is.finite(y_raw) & is.finite(x_raw) & y_raw != 0 & x_raw != 0
+    y <- y_raw[valid];  x <- x_raw[valid]
+
+    if (length(y) < 5)                  next
+    if (sd(y) < 1e-10 | sd(x) < 1e-10) next
+
+    tryCatch({
+      eg      <- engle_granger(y, x)
+      dols    <- dols_SW1993(y, x, include_trend = FALSE)
+      dols_tr <- dols_SW1993(y, x, include_trend = TRUE)
+
+      all_results[[length(all_results) + 1]] <- data.frame(
+        sector_num        = occ_num,
+        sector_name       = occ_name,
+        segment           = occ_seg,
+        class             = occ_cls,
+        year_start        = year_start,
+        quarter_start     = quarter_start,
+        year_end          = year_end,
+        quarter_end       = quarter_end,
+        n_obs             = length(y),
+        pair              = p$label,
+        eg_coef           = round(eg$coef,    4),
+        eg_adf_resid      = round(eg$adf_t,   4),
+        eg_coint          = coint_label(eg$adf_t),
+        dols_beta         = round(dols$beta,   4),
+        dols_se           = round(dols$se,     4),
+        dols_tstat        = round(dols$t_stat, 4),
+        dols_wald         = round(dols$wald,   4),
+        dols_adf_resid    = round(dols$adf_t,  4),
+        dols_coint        = coint_label(dols$adf_t),
+        dols_tr_beta      = round(dols_tr$beta,  4),
+        dols_tr_adf_resid = round(dols_tr$adf_t, 4),
+        dols_tr_coint     = coint_label(dols_tr$adf_t),
+        eg_dols_agree     = ifelse(coint_label(eg$adf_t) == coint_label(dols$adf_t), "YES", "NO"),
+        specification     = "bivariate"
+      )
+    }, error = function(e) {
+      message(paste0("Grp ", i, " (", occ_cls, ") | ", p$label, " | ", e$message))
+    })
+  }
+
+  # ---- MULTIVARIATE: Cobb-Douglas logVA ~ logL + logK ----
+  valid_mv <- is.finite(sub$log_va) & is.finite(sub$log_empl) &
+              is.finite(sub$log_investment) &
+              sub$log_va != 0 & sub$log_empl != 0 & sub$log_investment != 0
+  y  <- sub$log_va[valid_mv]
+  x1 <- sub$log_empl[valid_mv]
+  x2 <- sub$log_investment[valid_mv]
+
+  if (length(y) >= 5 && sd(y) > 1e-10 && sd(x1) > 1e-10 && sd(x2) > 1e-10) {
+    tryCatch({
+      n  <- length(y)
+      k  <- ifelse(n <= 150, 2, 3)
+      tr <- k + 2
+
+      dx1 <- diff(x1);  dx2 <- diff(x2)
+      ll  <- list()
+      for (j in -k:k) {
+        s1 <- rep(NA, n);  s2 <- rep(NA, n)
+        if (j <= 0) {
+          idx <- (1 - j):(n - 1)
+          s1[idx] <- dx1[1:length(idx)]
+          s2[idx] <- dx2[1:length(idx)]
+        } else {
+          idx <- 1:(n - j - 1)
+          s1[idx] <- dx1[(j+1):(j+length(idx))]
+          s2[idx] <- dx2[(j+1):(j+length(idx))]
+        }
+        ll[[paste0("dx1_", j)]] <- s1
+        ll[[paste0("dx2_", j)]] <- s2
+      }
+      ll_mat <- do.call(cbind, ll)
+
+      y_t  <- y[(tr+1):(n-tr)]
+      x1_t <- x1[(tr+1):(n-tr)]
+      x2_t <- x2[(tr+1):(n-tr)]
+      ll_t <- ll_mat[(tr+1):(n-tr), ]
+
+      X_mat <- cbind(1, x1_t, x2_t, ll_t)
+      fit   <- lm(y_t ~ X_mat - 1)
+      res   <- residuals(fit)
+      coefs <- coef(fit)
+
+      adf_mv <- tryCatch(
+        ur.df(res, type = "none", selectlags = "AIC")@teststat[1],
+        error = function(e) NA
+      )
+
+      all_results[[length(all_results) + 1]] <- data.frame(
+        sector_num        = occ_num,
+        sector_name       = occ_name,
+        segment           = occ_seg,
+        class             = occ_cls,
+        year_start        = year_start,
+        quarter_start     = quarter_start,
+        year_end          = year_end,
+        quarter_end       = quarter_end,
+        n_obs             = length(y_t),
+        pair              = "logVA ~ logL + logK",
+        eg_coef           = NA,
+        eg_adf_resid      = NA,
+        eg_coint          = NA,
+        dols_beta         = round(coefs[2], 4),   # labour elasticity
+        dols_se           = NA,
+        dols_tstat        = NA,
+        dols_wald         = NA,
+        dols_adf_resid    = round(adf_mv, 4),
+        dols_coint        = ifelse(!is.na(adf_mv) & adf_mv < CV_5, "YES (5%)", "NO"),
+        dols_tr_beta      = round(coefs[3], 4),   # capital elasticity
+        dols_tr_adf_resid = NA,
+        dols_tr_coint     = NA,
+        eg_dols_agree     = NA,
+        specification     = "multivariate"
+      )
+    }, error = function(e) {
+      message(paste0("Grp ", i, " | Cobb-Douglas | ", e$message))
+    })
+  }
+}
+
+# ------------------------------------------------------------
+# 9. COMBINE & EXPORT
+# ------------------------------------------------------------
+results_df <- do.call(rbind, all_results)
+rownames(results_df) <- NULL
+print(results_df)
+write.csv(results_df, "cointegration_results_SW1993.csv", row.names = FALSE)
+cat("Saved: cointegration_results_SW1993.csv\n")
+
+# ------------------------------------------------------------
+# 10. SUMMARY
+# ------------------------------------------------------------
+cat("\n===== SUMMARY =====\n")
+biv <- subset(results_df, specification == "bivariate")
+cat(sprintf("%-22s | %9s | %9s | %9s\n", "Pair", "EG", "DOLS", "Agree"))
+cat(strrep("-", 60), "\n")
+
+for (p in pairs) {
+  sub_r   <- subset(biv, pair == p$label)
+  n       <- nrow(sub_r)
+  eg_n    <- sum(sub_r$eg_coint   %in% c("YES (5%)", "YES (10%)"))
+  dols_n  <- sum(sub_r$dols_coint %in% c("YES (5%)", "YES (10%)"))
+  agree_n <- sum(sub_r$eg_dols_agree == "YES")
+  cat(sprintf("%-22s | %4d / %3d | %4d / %3d | %4d / %3d\n",
+    p$label, eg_n, n, dols_n, n, agree_n, n))
+}
+
+mv <- subset(results_df, specification == "multivariate")
+cat(sprintf("\nCobb-Douglas (logVA ~ logL + logK): %d groups run\n", nrow(mv)))
+cat(sprintf("Cointegrated at 5%%: %d / %d\n",
+    sum(mv$dols_coint == "YES (5%)", na.rm = TRUE), nrow(mv)))
