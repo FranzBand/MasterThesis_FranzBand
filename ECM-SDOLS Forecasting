@@ -1,0 +1,106 @@
+# ============================================================
+# STEP 1 — Already done: step1_y, step1_va, step1_k
+# ============================================================
+
+# Create first differences and lagged ec term in df_train
+df_train <- df_train %>%
+  arrange(code, year) %>%
+  group_by(code) %>%
+  mutate(
+    dlnl       = lnl   - lag(lnl),
+    d_error_va = error_va - lag(error_va),
+    d_error_k  = error_k  - lag(error_k),
+    ec_term    = lag(error_y, 1)       # lagged equilibrium error
+  ) %>%
+  ungroup()
+
+# ============================================================
+# STEP 2 — Fit ECM on training data
+# ============================================================
+step2_ecm <- lm(
+  dlnl ~ d_error_va + factor(sector):d_error_va +
+         d_error_k  + factor(sector):d_error_k  +
+         ec_term,
+  data      = df_train,
+  na.action = na.exclude
+)
+
+cat("ECM R-squared:", summary(step2_ecm)$r.squared, "\n")
+cat("Speed of adjustment (gamma):", coef(step2_ecm)["ec_term"], "\n")
+# gamma should be negative and between -1 and 0
+
+# ============================================================
+# STEP 3 — Prepare df_future for ECM forecast
+# ============================================================
+df_future <- df_future %>%
+  arrange(code, year) %>%
+  group_by(code) %>%
+  mutate(
+    # Step 1 forecasts for regressors
+    error_va   = predict(step1_va, newdata = cur_data()),
+    error_k    = predict(step1_k,  newdata = cur_data()),
+    d_error_va = error_va - lag(error_va),
+    d_error_k  = error_k  - lag(error_k),
+    # Option A: assume equilibrium at start of forecast
+    ec_term    = 0
+  ) %>%
+  ungroup()
+
+# ============================================================
+# STEP 4 — Recursive chain forecast of lnlhat
+# ============================================================
+
+# Get last observed lnl (2016) as starting point
+df_base <- df_train %>%
+  filter(year == 2016) %>%
+  select(code, lnl_base = lnl)
+
+df_future <- df_future %>%
+  left_join(df_base, by = "code")
+
+# Forecast dlnl for 2017-2022
+df_future$dlnl_hat <- predict(step2_ecm, newdata = df_future)
+
+# Reconstruct lnlhat cumulatively
+df_future <- df_future %>%
+  arrange(code, year) %>%
+  group_by(code) %>%
+  mutate(
+    lnlhat = lnl_base + cumsum(replace_na(dlnl_hat, 0))
+  ) %>%
+  ungroup()
+
+# ============================================================
+# STEP 5 — CI and PI (same as before)
+# ============================================================
+X0_train <- model.matrix(step2_ecm)
+X0_new   <- model.matrix(update(formula(step2_ecm), NULL ~ .), data = df_future)
+
+XtXi    <- solve(t(X0_train) %*% X0_train)
+lev_new <- rowSums((X0_new %*% XtXi) * X0_new)
+
+sigma_hat <- summary(step2_ecm)$sigma
+t_crit    <- qt(0.975, df = step2_ecm$df.residual)
+
+PI_half <- t_crit * sigma_hat * sqrt(1 + lev_new)
+CI_half <- t_crit * sigma_hat * sqrt(lev_new)
+
+df_future$lnlhat_lwr_PI <- df_future$lnlhat - PI_half
+df_future$lnlhat_upr_PI <- df_future$lnlhat + PI_half
+df_future$lnlhat_lwr_CI <- df_future$lnlhat - CI_half
+df_future$lnlhat_upr_CI <- df_future$lnlhat + CI_half
+
+# ============================================================
+# STEP 6 — Jensen correction and back-transform
+# ============================================================
+u_tilde <- residuals(step2_ecm)
+u_tilde <- u_tilde[!is.na(u_tilde)]
+
+delta0 <- exp(mean(u_tilde) + var(u_tilde) / 2)
+cat("delta0:", delta0, "\n")
+
+df_future$Lhat        <- delta0 * exp(df_future$lnlhat)
+df_future$Lhat_lwr_PI <- delta0 * exp(df_future$lnlhat_lwr_PI)
+df_future$Lhat_upr_PI <- delta0 * exp(df_future$lnlhat_upr_PI)
+df_future$Lhat_lwr_CI <- delta0 * exp(df_future$lnlhat_lwr_CI)
+df_future$Lhat_upr_CI <- delta0 * exp(df_future$lnlhat_upr_CI)
