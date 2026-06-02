@@ -1,0 +1,35 @@
+library(dplyr)
+
+# Create lagged residuals from Step 1
+df_train <- df_train %>%
+  arrange(code, year) %>%
+  group_by(code) %>%
+  mutate(
+    ec_term   = lag(error_y, 1),          # lagged equilibrium error
+    d_error_va = error_va - lag(error_va, 1),  # first difference of error_va
+    d_error_k  = error_k  - lag(error_k,  1),  # first difference of error_k
+    dlnl       = lnl - lag(lnl, 1)        # first difference of lnl
+  ) %>%
+  ungroup()
+
+# Fit ECM as Step 2
+step2_ecm <- lm(
+  dlnl ~ d_error_va + factor(sector):d_error_va +
+         d_error_k  + factor(sector):d_error_k  +
+         ec_term,
+  data      = df_train,
+  na.action = na.exclude
+)
+
+summary(step2_ecm)
+
+#second step
+
+df_future <- df_future %>%
+  arrange(code, year) %>%
+  group_by(code) %>%
+  mutate(
+    dlnl_hat = predict(step2_ecm, newdata = cur_data()),
+    lnlhat   = lag(lnl) + dlnl_hat
+  ) %>%
+  ungroup()
