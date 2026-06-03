@@ -1,0 +1,139 @@
+# ============================================================
+# FORECAST EVALUATION — RMSE, MAPE, Absolute Difference
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ============================================================
+# PART 1 — In-sample evaluation on training data (2013–2016)
+# ============================================================
+
+eval_train <- df_train %>%
+  filter(!is.na(lnlhat), !is.na(lnl)) %>%
+  mutate(
+    empl_hat_train = alpha_0 * exp(lnlhat),  # back-transform to levels
+    abs_diff       = abs(empl - empl_hat_train),
+    pct_error      = abs(empl - empl_hat_train) / abs(empl) * 100
+  )
+
+metrics_train <- eval_train %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_hat_train)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                       na.rm = TRUE),
+    MAD  = mean(abs_diff,                        na.rm = TRUE)   # Mean Absolute Difference
+  )
+
+cat("=== IN-SAMPLE (", data_start, "–", data_end, ") ===\n")
+print(metrics_train)
+
+# ============================================================
+# PART 2 — Out-of-sample evaluation (2017–2022, if actuals exist)
+# Only run this if you have observed empl in df_future
+# ============================================================
+
+eval_future <- df_future %>%
+  filter(!is.na(empl), !is.na(empl_segm_hat)) %>%   # only rows with actuals
+  mutate(
+    abs_diff  = abs(empl - empl_segm_hat),
+    pct_error = abs(empl - empl_segm_hat) / abs(empl) * 100
+  )
+
+metrics_future <- eval_future %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_segm_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                      na.rm = TRUE),
+    MAD  = mean(abs_diff,                       na.rm = TRUE)
+  )
+
+cat("=== OUT-OF-SAMPLE (", pgn_start, "–", pgn_end, ") ===\n")
+print(metrics_future)
+
+# ============================================================
+# PART 3 — Metrics per year (out-of-sample)
+# ============================================================
+
+metrics_by_year <- eval_future %>%
+  group_by(jaar) %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_segm_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                      na.rm = TRUE),
+    MAD  = mean(abs_diff,                       na.rm = TRUE),
+    n    = n(),
+    .groups = "drop"
+  )
+
+cat("\n=== METRICS PER YEAR ===\n")
+print(metrics_by_year)
+
+# ============================================================
+# PART 4 — Metrics per occupation segment (out-of-sample)
+# ============================================================
+
+metrics_by_segment <- eval_future %>%
+  group_by(brc2014segment) %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_segm_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                      na.rm = TRUE),
+    MAD  = mean(abs_diff,                       na.rm = TRUE),
+    n    = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(MAPE))  # worst performing segments at top
+
+cat("\n=== METRICS PER SEGMENT (sorted by MAPE) ===\n")
+print(metrics_by_segment)
+
+# ============================================================
+# PART 5 — Plot: Actual vs Predicted per year (aggregated)
+# ============================================================
+
+plot_eval <- df_future %>%
+  filter(!is.na(empl)) %>%
+  group_by(jaar) %>%
+  summarise(
+    actual    = sum(empl,          na.rm = TRUE),
+    predicted = sum(empl_segm_hat, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  pivot_longer(cols = c(actual, predicted),
+               names_to = "type", values_to = "employment")
+
+ggplot(plot_eval, aes(x = jaar, y = employment / 1e6, color = type, linetype = type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("actual" = "black", "predicted" = "steelblue")) +
+  scale_linetype_manual(values = c("actual" = "solid", "predicted" = "dashed")) +
+  scale_y_continuous(labels = scales::comma_format(suffix = "M")) +
+  scale_x_continuous(breaks = pgn_start:pgn_end) +
+  labs(
+    title    = "Actual vs Predicted Total Employment",
+    subtitle = paste0(pgn_start, "–", pgn_end),
+    x        = "Year",
+    y        = "Employment (millions)",
+    color    = "", linetype = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# ============================================================
+# PART 6 — Absolute difference plot per segment
+# ============================================================
+
+df_future %>%
+  filter(!is.na(empl)) %>%
+  mutate(abs_diff = abs(empl - empl_segm_hat)) %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(abs_diff = sum(abs_diff, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = jaar, y = abs_diff, fill = factor(brc2014segment))) +
+  geom_col(position = "stack") +
+  scale_x_continuous(breaks = pgn_start:pgn_end) +
+  labs(
+    title = "Total Absolute Difference by Segment and Year",
+    x     = "Year",
+    y     = "Absolute Difference (headcounts)",
+    fill  = "Segment"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")  # too many segments for legend
