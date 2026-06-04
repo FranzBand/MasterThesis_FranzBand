@@ -1,0 +1,234 @@
+# ============================================================
+# STOCK & WATSON (1993) DOLS — Forecasting Implementation
+# ============================================================
+library(dplyr)
+library(sandwich)   # for HAC/Newey-West covariance
+library(lmtest)     # for coeftest
+
+# ============================================================
+# STEP 1 — Unit root pre-tests (Augmented Dickey-Fuller)
+# Determine order of integration of each series
+# ============================================================
+library(tseries)
+
+# Test each series for I(1) — reject H0 means stationary
+adf.test(df_train$lnl,  k = 2)   # employment
+adf.test(df_train$lnva, k = 2)   # value added
+adf.test(df_train$lnk,  k = 2)   # capital
+
+# Test first differences — should be stationary (I(1) confirmed)
+adf.test(diff(df_train$lnl),  k = 2)
+adf.test(diff(df_train$lnva), k = 2)
+adf.test(diff(df_train$lnk),  k = 2)
+
+# ============================================================
+# STEP 2 — Cointegration test (Engle-Granger)
+# ============================================================
+# Static OLS first (SOLS) — baseline for residual test
+sols <- lm(lnl ~ lnva + lnk + factor(code), data = df_train,
+           na.action = na.exclude)
+resid_sols <- residuals(sols)
+
+# ADF on residuals — H0: no cointegration
+adf.test(resid_sols, k = 2)
+# Reject H0 → cointegration confirmed → proceed with DOLS
+
+# ============================================================
+# STEP 3 — DOLS: add leads and lags of first differences
+# Stock & Watson (1993) eq. (2.2):
+#   y_t2 = α + β*y_t1 + Σ d_j * Δy_t1[t+j] + v_t
+# In practice: regress lnl on lnva, lnk, and
+#              leads & lags of Δlnva and Δlnk
+# ============================================================
+
+# Choose number of leads/lags (k)
+# SW(1993): k = 2 for T~100, k = 3 for T~300
+n_obs <- nrow(df_train %>% filter(!is.na(lnl)))
+k_ll  <- if (n_obs >= 200) 3 else 2
+
+cat("Using k =", k_ll, "leads/lags\n")
+
+# Build leads and lags of Δlnva and Δlnk per group (code)
+df_dols <- df_train %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    dlnva = lnva - lag(lnva),
+    dlnk  = lnk  - lag(lnk)
+  ) %>%
+  ungroup()
+
+# Create leads and lags columns
+for (j in -k_ll:k_ll) {
+  suffix <- ifelse(j < 0, paste0("lag", abs(j)), 
+                   ifelse(j > 0, paste0("lead", j), "0"))
+  df_dols <- df_dols %>%
+    group_by(code) %>%
+    mutate(
+      !!paste0("dlnva_", suffix) := dplyr::lag(dlnva, -j),
+      !!paste0("dlnk_",  suffix) := dplyr::lag(dlnk,  -j)
+    ) %>%
+    ungroup()
+}
+
+# Construct DOLS regressor formula
+ll_vars_va <- paste0("dlnva_", 
+  c(paste0("lag",  k_ll:1), "0", paste0("lead", 1:k_ll)),
+  collapse = " + ")
+ll_vars_k  <- paste0("dlnk_",  
+  c(paste0("lag",  k_ll:1), "0", paste0("lead", 1:k_ll)),
+  collapse = " + ")
+
+dols_formula <- as.formula(paste(
+  "lnl ~ lnva + lnk + factor(code) +",
+  ll_vars_va, "+", ll_vars_k
+))
+
+# ============================================================
+# STEP 4 — Estimate DOLS (OLS on augmented regression)
+# ============================================================
+dols_fit <- lm(dols_formula, data = df_dols, na.action = na.exclude)
+
+# HAC-robust standard errors (SW1993 recommend AR spectral estimator)
+# Using Newey-West as practical equivalent
+dols_se <- coeftest(dols_fit, vcov = NeweyWest(dols_fit, lag = k_ll,
+                                                prewhite = FALSE))
+
+cat("\n=== DOLS Cointegrating Vector ===\n")
+print(dols_se[c("lnva", "lnk"), ])
+
+# Extract long-run elasticities
+beta_va <- coef(dols_fit)["lnva"]
+beta_k  <- coef(dols_fit)["lnk"]
+cat("\nLong-run output elasticity (lnva):", round(beta_va, 4))
+cat("\nLong-run capital elasticity  (lnk):", round(beta_k,  4), "\n")
+
+# ============================================================
+# STEP 5 — Cointegrating residuals (error correction term)
+# ============================================================
+df_dols <- df_dols %>%
+  mutate(
+    lnl_hat   = predict(dols_fit, newdata = df_dols),
+    ec_resid  = lnl - lnl_hat   # cointegrating residual
+  )
+
+# Inspect persistence of residuals — should be I(0)
+adf.test(na.omit(df_dols$ec_resid), k = 2)
+
+# ============================================================
+# STEP 6 — Error Correction Model (ECM) for short-run dynamics
+# Uses lagged cointegrating residual as EC term
+# ============================================================
+df_ecm <- df_dols %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    dlnl     = lnl  - lag(lnl),
+    ec_lag   = lag(ec_resid),     # error correction term (t-1)
+    dlnva_0  = dlnva,
+    dlnk_0   = dlnk
+  ) %>%
+  ungroup() %>%
+  filter(jaar >= min(jaar) + 1)   # drop first obs per group (NA from lag)
+
+ecm_fit <- lm(
+  dlnl ~ ec_lag + dlnva_0 + dlnk_0 + factor(code),
+  data = df_ecm, na.action = na.exclude
+)
+
+cat("\n=== ECM — Speed of Adjustment ===\n")
+print(summary(ecm_fit)$coefficients["ec_lag", ])
+
+gamma <- coef(ecm_fit)["ec_lag"]
+cat("\nGamma (speed of adjustment):", round(gamma, 4))
+cat("\n → Adjustment half-life:", 
+    round(-log(2) / log(1 + gamma), 2), "years\n")
+
+# ============================================================
+# STEP 7 — Forecast using DOLS long-run + ECM short-run
+# ============================================================
+
+# Build forecast df (same structure as df_dols but for future years)
+df_forecast <- df_future %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    dlnva = lnva - lag(lnva),
+    dlnk  = lnk  - lag(lnk)
+  ) %>%
+  ungroup()
+
+# Add leads/lags for future (leads will be NA at boundaries — acceptable)
+for (j in -k_ll:k_ll) {
+  suffix <- ifelse(j < 0, paste0("lag", abs(j)), 
+                   ifelse(j > 0, paste0("lead", j), "0"))
+  df_forecast <- df_forecast %>%
+    group_by(code) %>%
+    mutate(
+      !!paste0("dlnva_", suffix) := dplyr::lag(dlnva, -j),
+      !!paste0("dlnk_",  suffix) := dplyr::lag(dlnk,  -j)
+    ) %>%
+    ungroup()
+}
+
+# Long-run DOLS level forecast
+df_forecast$lnl_lr <- predict(dols_fit, newdata = df_forecast)
+
+# Short-run ECM correction
+# Initialize with last observed ec_resid from training
+last_ec <- df_dols %>%
+  filter(jaar == data_end) %>%
+  select(code, ec_resid) %>%
+  rename(ec_lag = ec_resid)
+
+df_forecast <- df_forecast %>%
+  left_join(last_ec, by = "code")
+
+df_forecast$dlnl_sr  <- predict(ecm_fit, newdata = df_forecast %>%
+                                   rename(ec_lag = ec_lag,
+                                          dlnva_0 = dlnva,
+                                          dlnk_0  = dlnk))
+
+# Combined forecast: long-run level + short-run adjustment
+df_forecast <- df_forecast %>%
+  mutate(lnl_dols_hat = lnl_lr + dlnl_sr)
+
+# ============================================================
+# STEP 8 — Jensen correction and back-transform
+# ============================================================
+dols_resid_train <- residuals(dols_fit)
+alpha_dols <- exp(mean(dols_resid_train, na.rm = TRUE) +
+                  var(dols_resid_train,  na.rm = TRUE) / 2)
+
+df_forecast <- df_forecast %>%
+  mutate(
+    lhat_dols     = alpha_dols * exp(lnl_dols_hat),
+    empl_dols_hat = lhat_dols * (empl_sec / (sum(lhat_dols, na.rm = TRUE) + 1))
+  )
+
+# ============================================================
+# STEP 9 — Evaluation vs SDOLS model
+# ============================================================
+eval_dols <- df_forecast %>%
+  group_by(sectorsbi08, jaar) %>%
+  summarise(
+    empl_actual  = first(empl_sec),
+    empl_hat     = sum(empl_dols_hat, na.rm = TRUE),
+    .groups      = "drop"
+  ) %>%
+  filter(!is.na(empl_actual), empl_actual > 0) %>%
+  mutate(
+    abs_diff  = abs(empl_actual - empl_hat),
+    pct_error = abs(empl_actual - empl_hat) / empl_actual * 100
+  )
+
+metrics_dols <- eval_dols %>%
+  summarise(
+    RMSE = sqrt(mean((empl_actual - empl_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                        na.rm = TRUE),
+    MAD  = mean(abs_diff,                         na.rm = TRUE),
+    model = "DOLS (Stock-Watson 1993)"
+  )
+
+cat("\n=== DOLS Forecast Evaluation ===\n")
+print(metrics_dols)
