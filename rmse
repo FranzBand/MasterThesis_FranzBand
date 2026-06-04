@@ -1,0 +1,151 @@
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ============================================================
+# PART 1 — In-sample metrics (training period 2013–2016)
+# ============================================================
+df_train$lhat_train <- alpha_0 * exp(df_train$lnlhat)
+
+eval_train <- df_train %>%
+  filter(!is.na(empl), !is.na(lhat_train), empl > 0) %>%
+  mutate(
+    abs_diff  = abs(empl - lhat_train),
+    pct_error = abs(empl - lhat_train) / empl * 100
+  )
+
+metrics_train <- eval_train %>%
+  summarise(
+    RMSE = sqrt(mean((empl - lhat_train)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                  na.rm = TRUE),
+    MAD  = mean(abs_diff,                   na.rm = TRUE)
+  )
+
+cat("=== IN-SAMPLE (", data_start, "–", data_end, ") ===\n")
+print(metrics_train)
+
+# ============================================================
+# PART 2 — Out-of-sample metrics (2017–2022, if actuals exist)
+# ============================================================
+eval_future <- df_future %>%
+  filter(!is.na(empl), !is.na(empl_segm_hat), empl > 0) %>%
+  mutate(
+    abs_diff  = abs(empl - empl_segm_hat),
+    pct_error = abs(empl - empl_segm_hat) / empl * 100
+  )
+
+metrics_future <- eval_future %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_segm_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                      na.rm = TRUE),
+    MAD  = mean(abs_diff,                       na.rm = TRUE)
+  )
+
+cat("\n=== OUT-OF-SAMPLE (", pgn_start, "–", pgn_end, ") ===\n")
+print(metrics_future)
+
+# ============================================================
+# PART 3 — Metrics per year
+# ============================================================
+metrics_by_year <- eval_future %>%
+  group_by(jaar) %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_segm_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                      na.rm = TRUE),
+    MAD  = mean(abs_diff,                       na.rm = TRUE),
+    n    = n(),
+    .groups = "drop"
+  )
+
+cat("\n=== METRICS PER YEAR ===\n")
+print(metrics_by_year)
+
+# ============================================================
+# PART 4 — Metrics per segment (sorted by MAPE)
+# ============================================================
+metrics_by_segment <- eval_future %>%
+  group_by(brc2014segment) %>%
+  summarise(
+    RMSE = sqrt(mean((empl - empl_segm_hat)^2, na.rm = TRUE)),
+    MAPE = mean(pct_error,                      na.rm = TRUE),
+    MAD  = mean(abs_diff,                       na.rm = TRUE),
+    n    = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(MAPE))
+
+cat("\n=== METRICS PER SEGMENT (worst MAPE first) ===\n")
+print(metrics_by_segment, n = Inf)
+
+# ============================================================
+# PART 5 — Plot: actual vs predicted total employment per year
+# ============================================================
+plot_eval <- df_future %>%
+  filter(!is.na(empl)) %>%
+  group_by(jaar) %>%
+  summarise(
+    Actual    = sum(empl,          na.rm = TRUE),
+    Predicted = sum(empl_segm_hat, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  pivot_longer(cols = c(Actual, Predicted),
+               names_to = "type", values_to = "employment")
+
+ggplot(plot_eval, aes(x = jaar, y = employment / 1e6,
+                      color = type, linetype = type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Actual" = "black",
+                                "Predicted" = "steelblue")) +
+  scale_linetype_manual(values = c("Actual" = "solid",
+                                   "Predicted" = "dashed")) +
+  scale_x_continuous(breaks = pgn_start:pgn_end) +
+  labs(
+    title    = "Actual vs Predicted Total Employment",
+    subtitle = paste0(pgn_start, "–", pgn_end),
+    x        = "Year",
+    y        = "Employment (millions)",
+    color    = "", linetype = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# ============================================================
+# PART 6 — Plot: RMSE and MAPE per year
+# ============================================================
+metrics_by_year %>%
+  pivot_longer(cols = c(RMSE, MAPE, MAD),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = jaar, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_x_continuous(breaks = pgn_start:pgn_end) +
+  scale_color_manual(values = c("RMSE" = "firebrick",
+                                "MAPE" = "steelblue",
+                                "MAD"  = "darkorange")) +
+  labs(
+    title = "Forecast Evaluation Metrics per Year",
+    x     = "Year",
+    y     = "Value",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# ============================================================
+# PART 7 — Plot: absolute difference per segment (top 15 worst)
+# ============================================================
+metrics_by_segment %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(factor(brc2014segment), MAPE), y = MAPE)) +
+  geom_col(fill = "steelblue", alpha = 0.85) +
+  geom_text(aes(label = round(MAPE, 1)), hjust = -0.2, size = 3) +
+  coord_flip() +
+  labs(
+    title    = "Top 15 Segments by MAPE (worst first)",
+    subtitle = paste0("Out-of-sample: ", pgn_start, "–", pgn_end),
+    x        = "Segment",
+    y        = "MAPE (%)"
+  ) +
+  theme_minimal()
