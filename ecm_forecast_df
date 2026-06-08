@@ -1,0 +1,59 @@
+# ============================================================
+# PREP — compute EC terms for df_future
+# ============================================================
+
+# Step 1: get Step 1 residuals for future period
+df_future$y_1      <- predict(step1_y,  newdata = df_future)
+df_future$va_hat   <- predict(step1_va, newdata = df_future)
+df_future$k_hat    <- predict(step1_k,  newdata = df_future)
+
+df_future$error_y  <- df_future$lnl  - df_future$y_1
+df_future$error_va <- df_future$lnva - df_future$va_hat
+df_future$error_k  <- df_future$lnk  - df_future$k_hat
+
+# Step 2: create lags of EC terms (per code, sorted by year)
+df_future <- df_future %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    ec_term      = lag(error_y),    # lagged own employment error
+    error_va_lag = lag(error_va),
+    error_k_lag  = lag(error_k)
+  ) %>%
+  ungroup()
+
+# ============================================================
+# FORECAST — predict dlnl, then recover lnl level
+# ============================================================
+df_future$pred_dlnl <- predict(step3_gamma, newdata = df_future)
+
+# Recover log level: lnl_t = lnl_{t-1} + pred_dlnl_t
+df_future <- df_future %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    # anchor: last known lnl from training period
+    lnl_last    = first(lnl),       # lnl at pgn_start (first future year)
+    pred_lnl    = lnl_last + cumsum(replace_na(pred_dlnl, 0))
+  ) %>%
+  ungroup()
+
+# ============================================================
+# Jensen correction and back-transform
+# ============================================================
+error_tilde <- df_train$dlnl - predict(step3_gamma, newdata = df_train)
+alpha_0     <- exp(mean(error_tilde, na.rm = TRUE) +
+                   var(error_tilde,  na.rm = TRUE) / 2)
+cat("alpha_0:", alpha_0, "\n")
+
+df_future <- df_future %>%
+  mutate(lhat = alpha_0 * exp(pred_lnl))
+
+# ============================================================
+# Rescale to absolute employment
+# ============================================================
+df_future <- df_future %>%
+  group_by(sectorsbi08, jaar) %>%
+  mutate(total_lhat = sum(lhat, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(empl_segm_hat = lhat * (empl_sec / (total_lhat + 1)))
