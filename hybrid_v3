@@ -1,0 +1,301 @@
+# ══════════════════════════════════════════════════════════════
+#  ECM-SDOLS EMPLOYMENT FORECAST — FULL PIPELINE
+# ══════════════════════════════════════════════════════════════
+library(tidyverse)
+
+# ──────────────────────────────────────────────────────────────
+# 0. SETTINGS
+# ──────────────────────────────────────────────────────────────
+train_start <- 1996
+train_end   <- 2016
+pgn_start   <- 2017
+pgn_end     <- 2022
+
+
+# ══════════════════════════════════════════════════════════════
+# 1. DATA PREPARATION
+#    ► df_main must contain:
+#      sector, brc2014segment, jaar, lnl, lnva, lnk,
+#      dlnva, dlnk, dlnva_s_vars, dlnk_s_vars, empl, empl_sec
+# ══════════════════════════════════════════════════════════════
+df_train <- df_main %>%
+  filter(jaar >= train_start & jaar <= train_end) %>%
+  arrange(sector, brc2014segment, jaar)
+
+
+# ══════════════════════════════════════════════════════════════
+# 2. STEP 1 — Short-run model (first differences)
+#    lnl ~ dlnva + sector:dlnva + dlnk + sector:dlnk
+# ══════════════════════════════════════════════════════════════
+step1 <- lm(
+  lnl ~ dlnva + factor(sector):dlnva +
+        dlnk  + factor(sector):dlnk,
+  data      = df_train,
+  na.action = na.exclude
+)
+
+df_train$yhat1   <- fitted(step1)
+df_train$error_y <- residuals(step1)
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. STEP 1b — Trend models for VA and K
+#    Needed to compute equilibrium residuals for Step 2
+# ══════════════════════════════════════════════════════════════
+step1_va <- lm(lnva ~ jaar + factor(sector), data = df_train,
+               na.action = na.exclude)
+step1_k  <- lm(lnk  ~ jaar + factor(sector), data = df_train,
+               na.action = na.exclude)
+
+df_train <- df_train %>%
+  mutate(
+    error_va = lnva - predict(step1_va, newdata = df_train),
+    error_k  = lnk  - predict(step1_k,  newdata = df_train)
+  )
+
+
+# ══════════════════════════════════════════════════════════════
+# 4. STEP 2 — Equilibrium error regression
+#    error_y ~ error_va + sector:error_va +
+#              error_k  + sector:error_k
+# ══════════════════════════════════════════════════════════════
+step2 <- lm(
+  error_y ~ error_va + factor(sector):error_va +
+            error_k  + factor(sector):error_k,
+  data      = df_train,
+  na.action = na.exclude
+)
+
+df_train <- df_train %>%
+  mutate(
+    uhat2   = fitted(step2),
+    lnlhat  = yhat1 + uhat2,          # reconstructed log employment
+    ec_term = lnl - lnlhat            # equilibrium error
+  )
+
+
+# ══════════════════════════════════════════════════════════════
+# 5. STEP 3 — ECM on first differences
+#    Δlnl ~ dlnl_lag + ec_term_lag +
+#            d_error_va + sector:d_error_va +
+#            d_error_k  + sector:d_error_k  +
+#            dlnva + dlnk + dlnva_s_vars + dlnk_s_vars
+# ══════════════════════════════════════════════════════════════
+
+# Compute first differences of errors and lags — grouped by sector
+df_train <- df_train %>%
+  arrange(sector, brc2014segment, jaar) %>%
+  group_by(brc2014segment) %>%
+  mutate(
+    dlnl        = lnl   - lag(lnl),
+    d_error_va  = error_va - lag(error_va),
+    d_error_k   = error_k  - lag(error_k),
+    ec_term_lag = lag(ec_term),           # ← ECM term: must be lagged
+    dlnl_lag    = lag(dlnl)               # ← persistence term
+  ) %>%
+  ungroup()
+
+step3_gamma_ecm <- lm(
+  dlnl ~ dlnl_lag + ec_term_lag +
+         d_error_va + factor(sector):d_error_va +
+         d_error_k  + factor(sector):d_error_k  +
+         dlnva + dlnk + dlnk_s_vars + dlnva_s_vars,
+  data      = df_train,
+  na.action = na.exclude
+)
+
+# Inspect speed of adjustment
+gamma <- coef(step3_gamma_ecm)["ec_term_lag"]
+cat("Speed of adjustment (gamma):", round(gamma, 4), "\n")
+cat("Adjustment half-life:", round(-log(2) / log(1 + gamma), 2), "years\n")
+
+
+# ══════════════════════════════════════════════════════════════
+# 6. JENSEN CORRECTION
+#    Corrects bias when converting from logs to levels
+# ══════════════════════════════════════════════════════════════
+u_tilde <- residuals(step3_gamma_ecm)
+delta0  <- exp(mean(u_tilde, na.rm = TRUE) + var(u_tilde, na.rm = TRUE) / 2)
+cat("Jensen correction factor (delta0):", round(delta0, 6), "\n")
+
+
+# ══════════════════════════════════════════════════════════════
+# 7. RECURSIVE FORECAST LOOP (2017–2022)
+#    Carries ec_term_lag and dlnl_lag forward year by year
+#    ► df_future must contain: sector, brc2014segment, jaar,
+#      lnva, lnk, dlnva, dlnk, dlnva_s_vars, dlnk_s_vars,
+#      empl_sec (sector totals for rescaling)
+# ══════════════════════════════════════════════════════════════
+
+# Prepare forecast VA/K residuals
+df_future <- df_future %>%
+  mutate(
+    error_va = lnva - predict(step1_va, newdata = df_future),
+    error_k  = lnk  - predict(step1_k,  newdata = df_future)
+  ) %>%
+  arrange(sector, brc2014segment, jaar) %>%
+  group_by(brc2014segment) %>%
+  mutate(
+    d_error_va = error_va - lag(error_va),
+    d_error_k  = error_k  - lag(error_k)
+  ) %>%
+  ungroup()
+
+# Seed state from last training year
+last_state <- df_train %>%
+  group_by(brc2014segment) %>%
+  slice_max(jaar) %>%
+  ungroup() %>%
+  select(
+    brc2014segment,
+    lnl_prev        = lnl,
+    lnlhat_prev     = lnlhat,
+    ec_term_lag_seed = ec_term,
+    dlnl_lag_seed    = dlnl
+  )
+
+results_list <- list()
+
+for (yr in pgn_start:pgn_end) {
+
+  yr_data <- df_future %>%
+    filter(jaar == yr) %>%
+    left_join(last_state, by = "brc2014segment") %>%
+    mutate(
+      ec_term_lag = ec_term_lag_seed,
+      dlnl_lag    = dlnl_lag_seed,
+      dlnva_0     = dlnva,
+      dlnk_0      = dlnk
+    )
+
+  # Step 1 prediction
+  yr_data <- yr_data %>%
+    mutate(yhat1 = predict(step1, newdata = .))
+
+  # Step 2 prediction
+  yr_data <- yr_data %>%
+    mutate(
+      uhat2  = predict(step2, newdata = .),
+      lnlhat = yhat1 + uhat2
+    )
+
+  # Step 3 prediction (Δlnl)
+  yr_data <- yr_data %>%
+    mutate(
+      dlnl_hat = predict(step3_gamma_ecm, newdata = .),
+      lnlhat   = lnl_prev + dlnl_hat,      # cumulate from previous level
+      ec_term  = lnlhat - (yhat1 + uhat2)  # new equilibrium error
+    )
+
+  results_list[[as.character(yr)]] <- yr_data
+
+  # Update state for next year
+  last_state <- yr_data %>%
+    transmute(
+      brc2014segment,
+      lnl_prev         = lnlhat,
+      lnlhat_prev      = lnlhat,
+      ec_term_lag_seed = ec_term,     # this year's ec → next year's lag
+      dlnl_lag_seed    = dlnl_hat     # this year's Δlnl → next year's lag
+    )
+}
+
+df_forecast <- bind_rows(results_list)
+
+
+# ══════════════════════════════════════════════════════════════
+# 8. BACK-TRANSFORM: logs → levels (Jensen correction)
+# ══════════════════════════════════════════════════════════════
+df_forecast <- df_forecast %>%
+  mutate(Lhat = delta0 * exp(lnlhat))
+
+
+# ══════════════════════════════════════════════════════════════
+# 9. RESCALE TO SECTOR TOTALS
+#    Ensures all segments within a sector sum to empl_sec
+# ══════════════════════════════════════════════════════════════
+df_forecast <- df_forecast %>%
+  group_by(sector, jaar) %>%
+  mutate(
+    empl_segm_hat = Lhat * (first(empl_sec) / sum(Lhat, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+
+# ══════════════════════════════════════════════════════════════
+# 10. PLOT — training (blue) vs forecast (red) vs observed (green)
+# ══════════════════════════════════════════════════════════════
+train_plot <- df_train %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(empl = sum(exp(lnl), na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "train")
+
+forecast_plot <- df_forecast %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(empl = sum(empl_segm_hat, na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "forecast")
+
+observed_plot <- df_main %>%
+  filter(jaar >= pgn_start & jaar <= pgn_end) %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(empl = sum(empl, na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "observed")
+
+df_plot <- bind_rows(train_plot, forecast_plot, observed_plot)
+
+dir.create("output", showWarnings = FALSE)
+
+for (seg in unique(df_plot$brc2014segment)) {
+
+  seg_clean <- gsub("[^a-zA-Z0-9]", "_", seg)
+
+  p <- df_plot %>%
+    filter(brc2014segment == seg) %>%
+    ggplot(aes(x = jaar, y = empl, color = type)) +
+    geom_line(linewidth = 1.2) +
+    scale_color_manual(values = c(
+      "train"    = "steelblue",
+      "forecast" = "firebrick",
+      "observed" = "darkgreen"
+    )) +
+    theme_minimal() +
+    labs(
+      title    = paste("Employment —", seg),
+      subtitle = "Blue = train | Red = forecast | Green = observed",
+      x = "Year", y = "Employment", color = ""
+    ) +
+    theme(legend.position = "bottom")
+
+  ggsave(
+    filename = paste0("output/ecm_sdols_", seg_clean, ".pdf"),
+    plot = p, width = 8, height = 5
+  )
+}
+
+
+# ══════════════════════════════════════════════════════════════
+# 11. EVALUATION
+# ══════════════════════════════════════════════════════════════
+eval_ecm <- df_forecast %>%
+  group_by(sector, jaar) %>%
+  summarise(
+    empl_actual = first(empl_sec),
+    empl_hat    = sum(empl_segm_hat, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  filter(!is.na(empl_actual), empl_actual > 0) %>%
+  mutate(
+    abs_diff  = abs(empl_actual - empl_hat),
+    pct_error = abs(empl_actual - empl_hat) / empl_actual * 100
+  )
+
+metrics_ecm <- eval_ecm %>%
+  summarise(
+    RMSE  = sqrt(mean((empl_actual - empl_hat)^2, na.rm = TRUE)),
+    MAPE  = mean(pct_error,                        na.rm = TRUE),
+    MAD   = mean(abs_diff,                         na.rm = TRUE),
+    model = "ECM-SDOLS"
+  )
+
+cat("\n=== ECM-SDOLS Forecast Evaluation ===\n")
+print(metrics_ecm)
