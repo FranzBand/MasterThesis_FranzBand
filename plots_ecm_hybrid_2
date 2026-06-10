@@ -1,0 +1,93 @@
+# ══════════════════════════════════════════════════════════════
+# PLOT — Training / Forecast / Observed per segment
+# ══════════════════════════════════════════════════════════════
+
+# ── 1. Prepare each series ────────────────────────────────────
+train_plot <- df_train %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(empl = sum(exp(lnl), na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "Training")
+
+forecast_plot <- df_forecast %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(empl = sum(empl_segm_hat, na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "Forecast")
+
+observed_plot <- df_main %>%
+  filter(jaar >= pgn_start & jaar <= pgn_end) %>%
+  group_by(brc2014segment, jaar) %>%
+  summarise(empl = sum(empl, na.rm = TRUE), .groups = "drop") %>%
+  mutate(type = "Observed")
+
+# ── 2. Combine ────────────────────────────────────────────────
+df_plot <- bind_rows(train_plot, forecast_plot, observed_plot) %>%
+  mutate(type = factor(type, levels = c("Training", "Forecast", "Observed")))
+
+# ── 3. Faceted plot — all segments at once ────────────────────
+ggplot(df_plot, aes(x = jaar, y = empl, color = type, linetype = type)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = pgn_start - 0.5,
+             linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  scale_color_manual(values = c(
+    "Training" = "steelblue",
+    "Forecast" = "firebrick",
+    "Observed" = "darkgreen"
+  )) +
+  scale_linetype_manual(values = c(
+    "Training" = "solid",
+    "Forecast" = "solid",
+    "Observed" = "dashed"
+  )) +
+  facet_wrap(~ brc2014segment, scales = "free_y") +
+  theme_minimal(base_size = 11) +
+  labs(
+    title    = "Employment forecast — ECM-SDOLS",
+    subtitle = "Dashed vertical line = start of forecast period",
+    x        = "Year",
+    y        = "Employment",
+    color    = "",
+    linetype = ""
+  ) +
+  theme(
+    legend.position  = "bottom",
+    strip.text       = element_text(size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+# ── 4. Save one PDF per segment ───────────────────────────────
+dir.create("output", showWarnings = FALSE)
+
+for (seg in unique(df_plot$brc2014segment)) {
+
+  seg_clean <- gsub("[^a-zA-Z0-9]", "_", seg)
+
+  p <- df_plot %>%
+    filter(brc2014segment == seg) %>%
+    ggplot(aes(x = jaar, y = empl, color = type, linetype = type)) +
+    geom_line(linewidth = 1.2) +
+    geom_vline(xintercept = pgn_start - 0.5,
+               linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = c(
+      "Training" = "steelblue",
+      "Forecast" = "firebrick",
+      "Observed" = "darkgreen"
+    )) +
+    scale_linetype_manual(values = c(
+      "Training" = "solid",
+      "Forecast" = "solid",
+      "Observed" = "dashed"
+    )) +
+    theme_minimal() +
+    labs(
+      title    = paste("Employment —", seg),
+      subtitle = "Blue = training | Red = forecast | Green = observed",
+      x = "Year", y = "Employment",
+      color = "", linetype = ""
+    ) +
+    theme(legend.position = "bottom")
+
+  ggsave(
+    filename = paste0("output/ecm_sdols_", seg_clean, ".pdf"),
+    plot = p, width = 8, height = 5
+  )
+}
