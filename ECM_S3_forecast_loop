@@ -1,0 +1,57 @@
+step3_gamma <- lm(
+  as.formula(paste(
+    "dlnl ~ error_va + factor(sectorsbi08):error_va",
+    "+ error_k + factor(sectorsbi08):error_k",
+    "+ dlnva + dlnk",
+    "+", dlnva_s_vars,
+    "+", dlnk_s_vars
+  )),
+  data = df_train
+)
+
+
+# ── Initialise columns ───────────────────────────────────────
+df_future$ec_term      <- NA_real_
+df_future$error_va_lag <- NA_real_
+df_future$error_k_lag  <- NA_real_
+df_future$pred_dlnl    <- NA_real_
+df_future$lnl          <- NA_real_
+
+years_future <- sort(unique(df_future$jaar))
+
+# ── Recursive loop ───────────────────────────────────────────
+for (yr in years_future) {
+  
+  curr <- df_future$jaar == yr
+  prev <- df_future$jaar == yr - 1
+  
+  # Set EC lags: first year from training anchor, rest from previous year
+  if (yr == pgn_start) {
+    df_future$ec_term[curr]      <- df_future$error_y_anchor[curr]
+    df_future$error_va_lag[curr] <- df_future$error_va_anchor[curr]
+    df_future$error_k_lag[curr]  <- df_future$error_k_anchor[curr]
+  } else {
+    df_future$ec_term[curr]      <- df_future$lnl[prev]  - predict(step1_y,  newdata = df_future[prev, ])
+    df_future$error_va_lag[curr] <- df_future$lnva[prev] - predict(step1_va, newdata = df_future[prev, ])
+    df_future$error_k_lag[curr]  <- df_future$lnk[prev]  - predict(step1_k,  newdata = df_future[prev, ])
+  }
+  
+  # Predict dlnl for this year
+  df_future$pred_dlnl[curr] <- predict(step3_gamma, newdata = df_future[curr, ])
+  
+  # Update lnl level
+  if (yr == pgn_start) {
+    df_future$lnl[curr] <- df_future$lnl_anchor[curr] + df_future$pred_dlnl[curr]
+  } else {
+    df_future$lnl[curr] <- df_future$lnl[prev] + df_future$pred_dlnl[curr]
+  }
+}
+
+# ── Verify ───────────────────────────────────────────────────
+df_future %>%
+  group_by(jaar) %>%
+  summarise(
+    na_ec   = sum(is.na(ec_term)),
+    na_lnl  = sum(is.na(lnl)),
+    na_pred = sum(is.na(pred_dlnl))
+  )
