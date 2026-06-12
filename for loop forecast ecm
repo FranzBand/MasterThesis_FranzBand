@@ -1,0 +1,63 @@
+results_list <- list()   # store results per code here
+
+for (cd in codes) {
+  
+  df_sub_train <- df_train[df_train$code == cd, ]
+  df_sub_fore  <- df_forecast[df_forecast$code == cd, ]
+  
+  model_cd <- lm(
+    dlnl ~ dlnl_lag + ec_term_lag + d_error_va + d_error_k + dlnva + dlnk,
+    data = df_sub_train
+  )
+  
+  anchor <- df_sub_train[df_sub_train$jaar == max(df_sub_train$jaar), ]
+  
+  # ── Initialise columns in subset ────────────────────────────
+  df_sub_fore$pred_dlnl   <- NA_real_
+  df_sub_fore$lnl         <- NA_real_
+  df_sub_fore$dlnl_lag    <- NA_real_
+  df_sub_fore$ec_term_lag <- NA_real_
+  df_sub_fore$d_error_va  <- NA_real_
+  df_sub_fore$d_error_k   <- NA_real_
+  
+  # ── Inner loop ───────────────────────────────────────────────
+  for (yr in years_future) {
+    curr <- df_sub_fore$jaar == yr
+    prev <- df_sub_fore$jaar == yr - 1
+    if (!any(curr)) next
+    
+    if (yr == pgn_start) {
+      df_sub_fore$dlnl_lag[curr]    <- anchor$dlnl
+      df_sub_fore$ec_term_lag[curr] <- anchor$ec_term
+      df_sub_fore$d_error_va[curr]  <- df_sub_fore$error_va[curr] - anchor$error_va
+      df_sub_fore$d_error_k[curr]   <- df_sub_fore$error_k[curr]  - anchor$error_k
+    } else if (any(prev)) {
+      df_sub_fore$dlnl_lag[curr]    <- df_sub_fore$pred_dlnl[prev]
+      df_sub_fore$ec_term_lag[curr] <- df_sub_fore$lnl[prev] - predict(step1_y,  newdata = df_sub_fore[prev, ])
+      prev_error_va <- df_sub_fore$lnva[prev] - predict(step1_va, newdata = df_sub_fore[prev, ])
+      prev_error_k  <- df_sub_fore$lnk[prev]  - predict(step1_k,  newdata = df_sub_fore[prev, ])
+      df_sub_fore$d_error_va[curr]  <- df_sub_fore$error_va[curr] - prev_error_va
+      df_sub_fore$d_error_k[curr]   <- df_sub_fore$error_k[curr]  - prev_error_k
+    }
+    
+    df_sub_fore$pred_dlnl[curr] <- predict(model_cd, newdata = df_sub_fore[curr, ])
+    
+    if (yr == pgn_start) {
+      df_sub_fore$lnl[curr] <- anchor$lnl + df_sub_fore$pred_dlnl[curr]
+    } else if (any(prev)) {
+      df_sub_fore$lnl[curr] <- df_sub_fore$lnl[prev] + df_sub_fore$pred_dlnl[curr]
+    }
+  }
+  
+  # ── Jensen correction + back-transform ───────────────────────
+  sigma2        <- summary(model_cd)$sigma^2
+  jensen_factor <- exp(sigma2 / 2)
+  df_sub_fore$lnl_corrected <- df_sub_fore$lnl + (sigma2 / 2)
+  df_sub_fore$L_forecast    <- exp(df_sub_fore$lnl_corrected)
+  
+  # ── Store subset result in list ───────────────────────────────
+  results_list[[as.character(cd)]] <- df_sub_fore
+}
+
+# ── Combine all codes into one dataframe ─────────────────────
+df_results <- bind_rows(results_list)
