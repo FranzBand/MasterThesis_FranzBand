@@ -1,0 +1,277 @@
+# ============================================================
+# STOCK & WATSON (1993) DOLS — Exact DOLS2 Implementation
+# Equation: lnl ~ lnk + lnva
+# SE: AR spectral estimator (SW 1993, Table I notes)
+# ============================================================
+library(dplyr)
+library(tseries)
+library(lmtest)
+
+# ============================================================
+# STEP 1 — Unit Root Pre-Tests (ADF)
+# ============================================================
+adf.test(df_train$lnl,  k = 2)
+adf.test(df_train$lnva, k = 2)
+adf.test(df_train$lnk,  k = 2)
+
+adf.test(diff(na.omit(df_train$lnl)),  k = 2)
+adf.test(diff(na.omit(df_train$lnva)), k = 2)
+adf.test(diff(na.omit(df_train$lnk)),  k = 2)
+
+# ============================================================
+# STEP 2 — Cointegration Test (Engle-Granger)
+# ============================================================
+sols     <- lm(lnl ~ lnva + lnk, data = df_train, na.action = na.exclude)
+adf.test(as.numeric(na.omit(residuals(sols))), k = 2)
+
+# ============================================================
+# STEP 3 — Build Leads/Lags of Δlnva and Δlnk
+# SW(1993): k=2 for T<=100, k=3 for T>=300 (Table I notes)
+# ============================================================
+n_obs <- sum(!is.na(df_train$lnl))
+k_ll  <- ifelse(n_obs <= 150, 2, 3)
+cat("T =", n_obs, "=> using k =", k_ll, "leads/lags\n")
+
+df_dols <- df_train %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    dlnva = lnva - lag(lnva),
+    dlnk  = lnk  - lag(lnk)
+  ) %>%
+  ungroup()
+
+for (j in -k_ll:k_ll) {
+  suffix <- ifelse(j < 0, paste0("lag", abs(j)),
+                   ifelse(j > 0, paste0("lead", j), "0"))
+  df_dols <- df_dols %>%
+    group_by(code) %>%
+    mutate(
+      !!paste0("dlnva_", suffix) := dplyr::lag(dlnva, -j),
+      !!paste0("dlnk_",  suffix) := dplyr::lag(dlnk,  -j)
+    ) %>%
+    ungroup()
+}
+
+# Drop groups too small for leads/lags
+min_obs <- 2 * k_ll + 3
+df_dols <- df_dols %>%
+  group_by(code) %>%
+  filter(sum(!is.na(lnl)) >= min_obs) %>%
+  ungroup()
+
+ll_vars_va <- paste0("dlnva_",
+  c(paste0("lag", k_ll:1), "0", paste0("lead", 1:k_ll)),
+  collapse = " + ")
+ll_vars_k <- paste0("dlnk_",
+  c(paste0("lag", k_ll:1), "0", paste0("lead", 1:k_ll)),
+  collapse = " + ")
+
+dols_formula <- as.formula(paste(
+  "lnl ~ lnva + lnk +", ll_vars_va, "+", ll_vars_k
+))
+
+# ============================================================
+# STEP 4 — Estimate DOLS
+# ============================================================
+dols_fit <- lm(dols_formula, data = df_dols, na.action = na.exclude)
+
+# ============================================================
+# STEP 5 — AR Spectral Estimator (DOLS2, SW 1993)
+# LRV = σ²_AR / (1 - Σφ_j)²
+# df adjustment: T - K_regressors - p_AR (Table I notes)
+# ============================================================
+ar_lrv_sw <- function(fit, ar_order) {
+
+  # Pull residuals directly from model object — avoids na.exclude padding
+  resids <- as.numeric(fit$residuals)
+  resids <- resids[is.finite(resids)]
+  n      <- length(resids)
+
+  # Fit AR(p) by OLS as in SW(1993)
+  ar_fit <- ar(resids, aic = FALSE, order.max = ar_order,
+               method = "ols", na.action = na.omit)
+
+  phi    <- if (length(ar_fit$ar) == 0) 0 else ar_fit$ar
+  sigma2 <- ar_fit$var.pred
+
+  sum_phi <- sum(phi)
+  if (!is.finite(sum_phi) || sum_phi >= 0.99) {
+    warning("AR sum of coefficients >= 0.99 — capping at 0.99")
+    sum_phi <- 0.99
+  }
+
+  # Long-run variance: SW(1993) eq. (4.4)
+  lrv <- sigma2 / (1 - sum_phi)^2
+
+  # Degrees-of-freedom correction (SW 1993, Table I notes)
+  # df = T - K_regressors - p_AR
+  K  <- length(coef(fit))
+  df <- n - K - ar_order
+
+  cat(sprintf(
+    "AR(%d) spectral LRV: %.6f | sigma2: %.6f | sum(phi): %.4f | df: %d\n",
+    ar_order, lrv, sigma2, sum_phi, df
+  ))
+
+  return(list(lrv = lrv, df = df, sigma2_ols = summary(fit)$sigma^2))
+}
+
+ar_result <- ar_lrv_sw(dols_fit, ar_order = k_ll)
+
+# ============================================================
+# STEP 6 — Build HAC vcov using SW(1993) rescaling
+# vcov_AR = (LRV / sigma2_OLS) * vcov_OLS
+# ============================================================
+vcov_ols <- vcov(dols_fit)                    # = sigma2_OLS * (X'X)^{-1}
+scale    <- ar_result$lrv / ar_result$sigma2_ols
+vcov_ar  <- scale * vcov_ols
+
+dols_se  <- coeftest(dols_fit, vcov = vcov_ar)
+
+cat("\n=== DOLS Cointegrating Vector (SW1993 AR Spectral SE) ===\n")
+print(dols_se[c("lnva", "lnk"), ])
+
+beta_va   <- coef(dols_fit)["lnva"]
+beta_k    <- coef(dols_fit)["lnk"]
+alpha_hat <- coef(dols_fit)["(Intercept)"]
+
+cat(sprintf("\nLong-run output elasticity beta_VA: %.4f\n", beta_va))
+cat(sprintf("Long-run capital elasticity  beta_K:  %.4f\n", beta_k))
+
+# ============================================================
+# STEP 7 — Cointegrating Residuals (EC Term)
+# ============================================================
+df_dols <- df_dols %>%
+  mutate(
+    lnl_hat  = predict(dols_fit, newdata = df_dols),
+    ec_resid = lnl - lnl_hat
+  )
+
+adf.test(as.numeric(na.omit(df_dols$ec_resid)), k = 2)
+
+# ============================================================
+# STEP 8 — Error Correction Model (ECM)
+# ============================================================
+df_ecm <- df_dols %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    dlnl    = lnl  - lag(lnl),
+    ec_lag  = lag(ec_resid),
+    dlnva_0 = dlnva,
+    dlnk_0  = dlnk
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(ec_lag), !is.na(dlnl))
+
+ecm_fit <- lm(
+  dlnl ~ ec_lag + dlnva_0 + dlnk_0,
+  data = df_ecm, na.action = na.exclude
+)
+
+cat("\n=== ECM — Speed of Adjustment ===\n")
+print(summary(ecm_fit)$coefficients)
+
+gamma <- coef(ecm_fit)["ec_lag"]
+cat(sprintf("\nGamma:                %.4f\n", gamma))
+cat(sprintf("Adjustment half-life: %.2f years\n",
+            -log(2) / log(1 + gamma)))
+
+# ============================================================
+# STEP 9 — Iterative Multi-Horizon Forecast
+# ============================================================
+data_end       <- max(df_train$jaar)
+forecast_years <- sort(unique(df_future$jaar))
+
+start_conditions <- df_dols %>%
+  filter(jaar == data_end) %>%
+  select(code,
+         lnl_last  = lnl,
+         lnva_last = lnva,
+         lnk_last  = lnk,
+         ec_lag    = ec_resid)
+
+all_forecasts <- list()
+
+for (grp in unique(df_future$code)) {
+
+  init <- start_conditions %>% filter(code == grp)
+  if (nrow(init) == 0) next
+
+  lnl_prev  <- init$lnl_last
+  lnva_prev <- init$lnva_last
+  lnk_prev  <- init$lnk_last
+  ec_t      <- init$ec_lag
+
+  for (h in seq_along(forecast_years)) {
+    yr  <- forecast_years[h]
+    fut <- df_future %>% filter(code == grp, jaar == yr)
+    if (nrow(fut) == 0) next
+
+    dlnva_0 <- fut$lnva - lnva_prev
+    dlnk_0  <- fut$lnk  - lnk_prev
+
+    # ECM: Δln L = δ + γ*ec_{t-1} + β_VA^SR*Δln VA + β_K^SR*Δln K
+    newdata_ecm <- data.frame(
+      ec_lag  = ec_t,
+      dlnva_0 = dlnva_0,
+      dlnk_0  = dlnk_0
+    )
+    dlnl_h <- predict(ecm_fit, newdata = newdata_ecm)
+
+    # Cumulate to level
+    lnl_h <- lnl_prev + dlnl_h
+
+    # Update EC term: ec_t = lnl_t - α - β_K*lnk_t - β_VA*lnva_t
+    ec_t <- lnl_h - alpha_hat - beta_k * fut$lnk - beta_va * fut$lnva
+
+    all_forecasts[[paste(grp, yr, sep = "_")]] <- data.frame(
+      code       = grp,
+      jaar       = yr,
+      horizon    = h,
+      lnl_fc     = lnl_h,
+      dlnl_fc    = dlnl_h,
+      ec_updated = ec_t,
+      dlnva      = dlnva_0,
+      dlnk       = dlnk_0
+    )
+
+    lnl_prev  <- lnl_h
+    lnva_prev <- fut$lnva
+    lnk_prev  <- fut$lnk
+  }
+}
+
+fc_df <- do.call(rbind, all_forecasts)
+
+# ============================================================
+# STEP 10 — Jensen Correction and Back-Transform
+# ============================================================
+resids_train <- as.numeric(dols_fit$residuals)
+resids_train <- resids_train[is.finite(resids_train)]
+
+alpha_dols <- exp(mean(resids_train) + var(resids_train) / 2)
+
+fc_df <- fc_df %>%
+  group_by(jaar) %>%
+  mutate(
+    lhat          = alpha_dols * exp(lnl_fc),
+    empl_dols_hat = lhat * (empl_sec / sum(lhat, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+write.csv(fc_df, "ecm_forecasts_iterative.csv", row.names = FALSE)
+
+# ============================================================
+# SUMMARY
+# ============================================================
+cat(sprintf("\nGroups forecast:      %d\n",  n_distinct(fc_df$code)))
+cat(sprintf("Horizons:             %d\n",   n_distinct(fc_df$jaar)))
+cat(sprintf("Total rows:           %d\n",   nrow(fc_df)))
+cat(sprintf("AR order (k_ll):      %d\n",   k_ll))
+cat(sprintf("AR spectral LRV:      %.6f\n", ar_result$lrv))
+cat(sprintf("Gamma:                %.4f\n", gamma))
+cat(sprintf("Adjustment half-life: %.2f years\n",
+            -log(2) / log(1 + gamma)))
+flush.console()
