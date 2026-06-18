@@ -1,0 +1,67 @@
+# ============================================================
+# Run forecast year by year — reuse working single-year loop
+# ============================================================
+
+# Starting point: last training year
+current_conditions <- start_conditions   # from your working code
+
+all_years <- list()
+
+for (yr in forecast_years) {   # forecast_years = e.g. c(2025,2026,...,2030)
+
+  cat("Forecasting year:", yr, "\n")
+
+  fc_yr <- list()
+
+  for (grp in unique(df_future$code)) {
+
+    init <- current_conditions %>% filter(code == grp)
+    if (nrow(init) == 0) next
+
+    fut <- df_future %>% filter(code == grp, jaar == yr)
+    if (nrow(fut) == 0) next
+
+    dlnva_0 <- as.numeric(fut$lnva) - as.numeric(init$lnva_last)
+    dlnk_0  <- as.numeric(fut$lnk)  - as.numeric(init$lnk_last)
+
+    dlnl_h <- as.numeric(predict(ecm_fit, newdata = data.frame(
+      ec_lag  = as.numeric(init$ec_lag),
+      dlnva_0 = dlnva_0,
+      dlnk_0  = dlnk_0
+    )))
+
+    lnl_h <- as.numeric(init$lnl_last) + dlnl_h
+    ec_new <- lnl_h - alpha_hat - beta_k * as.numeric(fut$lnk) - beta_va * as.numeric(fut$lnva)
+
+    fc_yr[[as.character(grp)]] <- data.frame(
+      code      = grp,
+      jaar      = yr,
+      lnl_fc    = lnl_h,
+      dlnl_fc   = dlnl_h,
+      ec_updated = ec_new,
+      lnl_last  = lnl_h,           # pass forward
+      lnva_last = as.numeric(fut$lnva),
+      lnk_last  = as.numeric(fut$lnk),
+      ec_lag    = ec_new,           # pass forward
+      row.names = NULL
+    )
+  }
+
+  # Stack this year's results
+  fc_yr_df <- do.call(rbind, fc_yr)
+  cat("  -> rows stored:", nrow(fc_yr_df), "\n")
+
+  all_years[[as.character(yr)]] <- fc_yr_df
+
+  # ---- Update conditions for next year ----
+  current_conditions <- fc_yr_df %>%
+    select(code, lnl_last, lnva_last, lnk_last, ec_lag)
+}
+
+# Combine all years
+fc_df <- do.call(rbind, all_years)
+rownames(fc_df) <- NULL
+
+cat("\nTotal rows:", nrow(fc_df), "\n")
+cat("Years:     ", sort(unique(fc_df$jaar)), "\n")
+cat("Groups:    ", n_distinct(fc_df$code), "\n")
