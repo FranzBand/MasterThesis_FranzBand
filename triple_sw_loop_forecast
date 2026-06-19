@@ -1,0 +1,129 @@
+# ============================================================
+# THREE-LEVEL DOLS + ECM FORECASTING LOOP — with cleanup
+# ============================================================
+
+df_pred_all <- data.frame()
+segments    <- unique(df$segment)
+
+# ============================================================
+# OUTER LOOP — over segments
+# ============================================================
+for (seg in segments) {
+
+  df_seg      <- df %>% filter(segment == seg)
+  df_pred_seg <- data.frame()
+  temp_sectors <- unique(df_seg$sector)
+
+  # ==========================================================
+  # MIDDLE LOOP — over sectors within segment
+  # ==========================================================
+  for (sec in temp_sectors) {
+
+    df_sec       <- df_seg %>% filter(sector == sec)
+    df_train     <- df_sec %>% filter(!is.na(lnl))
+    df_fc        <- df_sec %>% filter(is.na(lnl))
+    fc_years     <- sort(unique(df_fc$jaar))
+
+    if (nrow(df_train) < 10 || length(fc_years) == 0) {
+      rm(df_sec, df_train, df_fc, fc_years)
+      next
+    }
+
+    # --- Step 1: DOLS ----------------------------------------
+    lm_dols  <- lm(dols_formula, data = df_train)
+
+    # --- Step 2: ECM residuals on training data --------------
+    df_train <- df_train %>%
+      mutate(ec_resid = residuals(lm_dols)) %>%
+      arrange(code, jaar) %>%
+      group_by(code) %>%
+      mutate(ec_lag = lag(ec_resid, 1)) %>%
+      ungroup()
+
+    # --- Step 3: ECM -----------------------------------------
+    df_ecm_train <- df_train %>% filter(!is.na(ec_lag) & !is.na(dlnl_lag))
+    lm_ecm       <- lm(ecm_formula, data = df_ecm_train)
+
+    # Working copy of full sector df (train + forecast rows)
+    df_sec_working <- df_sec
+
+    # Write ec_resid from training back into working df
+    df_sec_working <- df_sec_working %>%
+      rows_update(
+        df_train %>% select(code, jaar, ec_resid),
+        by = c("code", "jaar")
+      )
+
+    # ========================================================
+    # INNER LOOP — over forecast years (one-step-ahead)
+    # ========================================================
+    for (yr in fc_years) {
+
+      prev_rows  <- df_sec_working %>% filter(jaar == yr - 1, !is.na(lnl))
+      prev2_rows <- df_sec_working %>% filter(jaar == yr - 2, !is.na(lnl))
+      curr_rows  <- df_sec_working %>% filter(jaar == yr)
+
+      if (nrow(prev_rows) == 0 || nrow(prev2_rows) == 0) {
+        rm(prev_rows, prev2_rows, curr_rows)
+        next
+      }
+
+      # Build ECM predictors
+      curr_rows <- curr_rows %>%
+        left_join(
+          prev_rows %>% select(code, lnl, lnva, lnk, ec_resid) %>%
+            rename(lnl_prev = lnl, lnva_prev = lnva,
+                   lnk_prev = lnk, ec_lag    = ec_resid),
+          by = "code"
+        ) %>%
+        left_join(
+          prev2_rows %>% select(code, lnl) %>% rename(lnl_prev2 = lnl),
+          by = "code"
+        ) %>%
+        mutate(
+          dlnl_lag = lnl_prev  - lnl_prev2,
+          dlnva    = lnva      - lnva_prev,
+          dlnk     = lnk       - lnk_prev
+        )
+
+      # Predict long-run and ECM correction
+      curr_rows <- curr_rows %>%
+        mutate(
+          lnl_hat_lr = predict(lm_dols, newdata = curr_rows),
+          dlnl_hat   = predict(lm_ecm,  newdata = curr_rows),
+          lnl        = lnl_prev + dlnl_hat,
+          ec_resid   = lnl - lnl_hat_lr
+        )
+
+      # Write back into working df
+      df_sec_working <- df_sec_working %>%
+        rows_update(
+          curr_rows %>% select(code, jaar, lnl, lnl_hat_lr, dlnl_hat, ec_resid),
+          by = c("code", "jaar")
+        )
+
+      # Clean up inner loop temporaries
+      rm(prev_rows, prev2_rows, curr_rows)
+
+    } # end inner loop
+
+    # Collect predictions for this sector
+    df_pred_seg <- bind_rows(
+      df_pred_seg,
+      df_sec_working %>% filter(jaar %in% fc_years)
+    )
+
+    # Clean up middle loop temporaries
+    rm(df_sec, df_train, df_fc, fc_years,
+       df_ecm_train, lm_dols, lm_ecm,
+       df_sec_working)
+
+  } # end middle loop
+
+  # Collect predictions for this segment
+  df_pred_all <- bind_rows(df_pred_all, df_pred_seg)
+
+  # Clean up outer loop temporaries
+  rm(df_seg, df_pred_seg, temp_sectors)
+
+} # end outer loop
