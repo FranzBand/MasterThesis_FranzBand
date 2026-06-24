@@ -1,0 +1,159 @@
+library(dplyr)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 1 — Long-run cointegrating models (already estimated)
+# ══════════════════════════════════════════════════════════════
+# step1_y  <- lm(lnl  ~ factor(sectorsbi08) + dlnva + dlnk, data = df_train)
+# step1_va <- lm(lnva ~ factor(sectorsbi08) + dlnva + dlnk, data = df_train)
+# step1_k  <- lm(lnk  ~ factor(sectorsbi08) + dlnva + dlnk, data = df_train)
+
+# ── Verify no rank deficiency on forecast data ───────────────
+suppressWarnings({
+  test_y  <- predict(step1_y,  newdata = df_forecast)
+  test_va <- predict(step1_va, newdata = df_forecast)
+  test_k  <- predict(step1_k,  newdata = df_forecast)
+})
+cat("NAs in step1_y forecast:",  sum(is.na(test_y)),  "\n")
+cat("NAs in step1_va forecast:", sum(is.na(test_va)), "\n")
+cat("NAs in step1_k forecast:",  sum(is.na(test_k)),  "\n")
+
+# ══════════════════════════════════════════════════════════════
+# STEP 2 — Compute EC residuals in training data
+# ══════════════════════════════════════════════════════════════
+df_train$error_va <- df_train$lnva - predict(step1_va, newdata = df_train)
+df_train$error_k  <- df_train$lnk  - predict(step1_k,  newdata = df_train)
+df_train$ec_term  <- df_train$lnl  - predict(step1_y,  newdata = df_train)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 3 — Compute lagged EC terms and differences in training
+# ══════════════════════════════════════════════════════════════
+df_train <- df_train %>%
+  arrange(code, jaar) %>%
+  group_by(code) %>%
+  mutate(
+    ec_term_lag  = lag(ec_term),
+    error_va_lag = lag(error_va),
+    error_k_lag  = lag(error_k),
+    d_error_va   = error_va - error_va_lag,
+    d_error_k    = error_k  - error_k_lag,
+    dlnl_lag     = lag(dlnl)
+  ) %>%
+  ungroup()
+
+# ══════════════════════════════════════════════════════════════
+# STEP 4 — Pre-compute EC residuals in forecast data
+# ══════════════════════════════════════════════════════════════
+df_forecast$error_va <- df_forecast$lnva - predict(step1_va, newdata = df_forecast)
+df_forecast$error_k  <- df_forecast$lnk  - predict(step1_k,  newdata = df_forecast)
+
+# ══════════════════════════════════════════════════════════════
+# STEP 5 — Stability check before forecasting
+# ══════════════════════════════════════════════════════════════
+for (cd in codes) {
+  df_sub <- df_train[df_train$code == cd, ]
+  m <- lm(dlnl ~ dlnl_lag + ec_term_lag + d_error_va + d_error_k + dlnva + dlnk,
+           data = df_sub)
+  g <- coef(m)["ec_term_lag"]
+  if (any(is.na(coef(m))))    cat("NA coef - code:", cd, "\n")
+  if (!is.na(g) && (g >= 0 || g <= -1)) cat("Unstable - code:", cd, "| gamma =", round(g, 3), "\n")
+}
+
+# ══════════════════════════════════════════════════════════════
+# STEP 6 — Double loop: ECM forecast per code per year
+# ══════════════════════════════════════════════════════════════
+years_future <- sort(unique(df_forecast$jaar))
+results_list <- list()
+
+for (cd in codes) {
+  
+  df_sub_train <- df_train[df_train$code == cd, ]
+  df_sub_fore  <- df_forecast[df_forecast$code == cd, ]
+  
+  # Estimate short-run ECM
+  model_cd <- lm(
+    dlnl ~ dlnl_lag + ec_term_lag + d_error_va + d_error_k + dlnva + dlnk,
+    data = df_sub_train
+  )
+  
+  # Skip codes with broken models
+  if (any(is.na(coef(model_cd)))) {
+    warning(paste("Skipping code", cd, "- NA coefficients"))
+    next
+  }
+  
+  # Extract coefficients
+  cf           <- coef(model_cd)
+  alpha        <- cf["(Intercept)"]
+  b_dlnl_lag   <- cf["dlnl_lag"]
+  gamma        <- cf["ec_term_lag"]
+  b_d_error_va <- cf["d_error_va"]
+  b_d_error_k  <- cf["d_error_k"]
+  b_dlnva      <- cf["dlnva"]
+  b_dlnk       <- cf["dlnk"]
+  
+  # Anchor from last training year
+  anchor <- df_sub_train[df_sub_train$jaar == max(df_sub_train$jaar), ]
+  
+  # Initialise scalars
+  lnl_prev      <- anchor$lnl
+  dlnl_prev     <- anchor$dlnl
+  error_va_prev <- anchor$error_va
+  error_k_prev  <- anchor$error_k
+  ec_prev       <- anchor$ec_term
+  
+  # Initialise result columns
+  df_sub_fore$pred_dlnl   <- NA_real_
+  df_sub_fore$lnl         <- NA_real_
+  
+  # Inner loop — one row at a time using scalars
+  for (i in seq_len(nrow(df_sub_fore))) {
+    
+    row <- df_sub_fore[i, ]
+    
+    # Current EC residuals from exogenous lnva, lnk
+    error_va_curr <- row$error_va
+    error_k_curr  <- row$error_k
+    
+    # Short-run differences
+    d_error_va_curr <- error_va_curr - error_va_prev
+    d_error_k_curr  <- error_k_curr  - error_k_prev
+    
+    # Predict dlnl using explicit coefficients
+    pred_dlnl <- alpha +
+      b_dlnl_lag   * dlnl_prev +
+      gamma        * ec_prev +
+      b_d_error_va * d_error_va_curr +
+      b_d_error_k  * d_error_k_curr +
+      b_dlnva      * row$dlnva +
+      b_dlnk       * row$dlnk
+    
+    lnl_curr <- lnl_prev + pred_dlnl
+    
+    # Store results
+    df_sub_fore$pred_dlnl[i] <- pred_dlnl
+    df_sub_fore$lnl[i]       <- lnl_curr
+    
+    # Update all scalars for next year
+    lnl_prev      <- lnl_curr
+    dlnl_prev     <- pred_dlnl
+    ec_prev       <- lnl_curr - predict(step1_y, newdata = row)
+    error_va_prev <- error_va_curr
+    error_k_prev  <- error_k_curr
+  }
+  
+  # Jensen correction + back-transform
+  sigma2 <- summary(model_cd)$sigma^2
+  df_sub_fore$lnl_corrected <- df_sub_fore$lnl + sigma2 / 2
+  df_sub_fore$L_forecast    <- exp(df_sub_fore$lnl_corrected)
+  
+  results_list[[as.character(cd)]] <- df_sub_fore
+}
+
+# ══════════════════════════════════════════════════════════════
+# STEP 7 — Combine and validate
+# ══════════════════════════════════════════════════════════════
+df_results <- bind_rows(results_list)
+
+cat("lnl range:      ", range(df_results$lnl,       na.rm = TRUE), "\n")
+cat("pred_dlnl range:", range(df_results$pred_dlnl, na.rm = TRUE), "\n")
+cat("L_forecast range:", range(df_results$L_forecast, na.rm = TRUE), "\n")
