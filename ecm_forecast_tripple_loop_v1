@@ -1,0 +1,291 @@
+# ============================================================
+# FULL HYBRID ECM FORECASTING PIPELINE — with 2nd stage EC
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# ============================================================
+# PART 1 — DATA PREPARATION
+# ============================================================
+
+# --- 1.1: Ensure correct types and sorting ------------------
+df <- df %>%
+  mutate(
+    code     = as.character(code),
+    sector   = as.character(sector),
+    segment  = str_pad(as.character(segment), width = 4, pad = "0", side = "left"),
+    jaar     = as.integer(jaar)
+  ) %>%
+  arrange(code, jaar)
+
+# --- 1.2: Compute log levels --------------------------------
+df <- df %>%
+  mutate(
+    lnl  = log(l),    # replace l, va, k with your actual column names
+    lnva = log(va),
+    lnk  = log(k)
+  )
+
+# --- 1.3: Compute first differences per code ----------------
+df <- df %>%
+  group_by(code) %>%
+  mutate(
+    dlnl  = lnl  - lag(lnl),
+    dlnva = lnva - lag(lnva),
+    dlnk  = lnk  - lag(lnk)
+  ) %>%
+  ungroup()
+
+# --- 1.4: Split training vs forecast rows -------------------
+# training_end_year <- 2016  # set your cutoff here
+df <- df %>%
+  mutate(lnl = ifelse(jaar > training_end_year, NA_real_, lnl))
+
+# --- 1.5: Sanity check --------------------------------------
+cat("Total rows:          ", nrow(df), "\n")
+cat("Training rows:       ", sum(!is.na(df$lnl)), "\n")
+cat("Forecast rows:       ", sum(is.na(df$lnl)), "\n")
+cat("Codes:               ", n_distinct(df$code), "\n")
+cat("Sectors:             ", n_distinct(df$sector), "\n")
+cat("Segments:            ", n_distinct(df$segment), "\n")
+cat("Year range:          ", range(df$jaar), "\n")
+
+# ============================================================
+# PART 2 — FORMULA DEFINITIONS
+# ============================================================
+
+# Long-run cointegrating formulas (adjust RHS to your data)
+formula_y  <- lnl  ~ factor(sectorsbi08) + lnva + lnk
+formula_va <- lnva ~ factor(sectorsbi08) + lnva + lnk
+formula_k  <- lnk  ~ factor(sectorsbi08) + lnva + lnk
+
+# Second-stage EC regression formula
+formula_ec2 <- ec_term ~ error_va + error_k
+
+# Short-run ECM formula (estimated per code)
+ecm_formula <- dlnl ~ dlnl_lag + ec_term_lag +
+                      d_error_va + d_error_k +
+                      dlnva + dlnk
+
+# ============================================================
+# PART 3 — PRE-LOOP CHECKS
+# ============================================================
+
+obs_per_code <- df %>%
+  filter(!is.na(lnl)) %>%
+  group_by(code) %>%
+  summarise(n_train = n(), .groups = "drop")
+
+fc_per_code <- df %>%
+  filter(is.na(lnl)) %>%
+  group_by(code) %>%
+  summarise(n_fc = n(), .groups = "drop")
+
+cat("Codes with < 10 training obs: ", sum(obs_per_code$n_train < 10), "\n")
+cat("Codes with forecast rows:     ", nrow(fc_per_code), "\n")
+
+df_fc_check <- df %>% filter(is.na(lnl))
+cat("NAs in dlnva (forecast): ", sum(is.na(df_fc_check$dlnva)), "\n")
+cat("NAs in dlnk  (forecast): ", sum(is.na(df_fc_check$dlnk)),  "\n")
+cat("NAs in lnva  (forecast): ", sum(is.na(df_fc_check$lnva)),  "\n")
+cat("NAs in lnk   (forecast): ", sum(is.na(df_fc_check$lnk)),   "\n")
+rm(obs_per_code, fc_per_code, df_fc_check)
+
+# ============================================================
+# PART 4 — THREE-LEVEL HYBRID ECM FORECASTING LOOP
+# ============================================================
+
+df_pred_all <- data.frame()
+segments    <- unique(df$segment)
+
+# ── OUTER LOOP: segments ────────────────────────────────────
+for (seg in segments) {
+
+  df_seg       <- df %>% filter(segment == seg)
+  df_pred_seg  <- data.frame()
+  temp_sectors <- unique(df_seg$sector)
+
+  # ── MIDDLE LOOP: sectors ────────────────────────────────
+  for (sec in temp_sectors) {
+
+    df_sec   <- df_seg %>% filter(sector == sec)
+    df_train <- df_sec %>% filter(!is.na(lnl))
+    df_fore  <- df_sec %>% filter(is.na(lnl))
+    codes    <- unique(df_train$code)
+
+    if (nrow(df_train) < 10 || nrow(df_fore) == 0) {
+      rm(df_sec, df_train, df_fore, codes)
+      next
+    }
+
+    # ── Step 1: Long-run cointegrating models ─────────────
+    step1_y  <- lm(formula_y,  data = df_train)
+    step1_va <- lm(formula_va, data = df_train)
+    step1_k  <- lm(formula_k,  data = df_train)
+
+    # ── Step 2: First-stage EC residuals on training data ─
+    df_train$error_va <- df_train$lnva - predict(step1_va, newdata = df_train)
+    df_train$error_k  <- df_train$lnk  - predict(step1_k,  newdata = df_train)
+    df_train$ec_term  <- df_train$lnl  - predict(step1_y,  newdata = df_train)
+
+    # ── Step 2b: Second-stage EC regression ───────────────
+    # Purge ec_term of variation explained by error_va, error_k
+    step2_ec          <- lm(formula_ec2, data = df_train)
+    df_train$ec_term2 <- residuals(step2_ec)
+
+    # ── Step 3: Lagged terms and short-run differences ────
+    df_train <- df_train %>%
+      arrange(code, jaar) %>%
+      group_by(code) %>%
+      mutate(
+        ec_term_lag  = lag(ec_term2),   # uses purged EC term
+        error_va_lag = lag(error_va),
+        error_k_lag  = lag(error_k),
+        d_error_va   = error_va - error_va_lag,
+        d_error_k    = error_k  - error_k_lag,
+        dlnl_lag     = lag(dlnl)
+      ) %>%
+      ungroup()
+
+    # ── Step 4: Pre-compute EC residuals on forecast data ─
+    df_fore$error_va <- df_fore$lnva - predict(step1_va, newdata = df_fore)
+    df_fore$error_k  <- df_fore$lnk  - predict(step1_k,  newdata = df_fore)
+    # Note: ec_term2 on forecast rows is propagated via
+    # the scalar ec_prev inside the year loop below
+
+    # ── Step 5: Stability check ───────────────────────────
+    for (cd in codes) {
+      df_sub <- df_train[df_train$code == cd, ]
+      m      <- lm(ecm_formula, data = df_sub)
+      g      <- coef(m)["ec_term_lag"]
+      if (any(is.na(coef(m))))
+        cat("NA coef  - seg:", seg, "sec:", sec, "code:", cd, "\n")
+      if (!is.na(g) && (g >= 0 | g <= -1))
+        cat("Unstable - seg:", seg, "sec:", sec, "code:", cd,
+            "| gamma =", round(g, 3), "\n")
+      rm(df_sub, m, g)
+    }
+
+    results_list <- list()
+
+    # ── INNER LOOP: codes ──────────────────────────────────
+    for (cd in codes) {
+
+      df_sub_train <- df_train[df_train$code == cd, ]
+      df_sub_fore  <- df_fore[df_fore$code   == cd, ]
+
+      if (nrow(df_sub_fore) == 0) next
+
+      # Estimate short-run ECM per code
+      df_ecm_train <- df_sub_train %>%
+        filter(!is.na(ec_term_lag), !is.na(dlnl_lag))
+
+      model_cd <- lm(ecm_formula, data = df_ecm_train)
+
+      if (any(is.na(coef(model_cd)))) {
+        warning(paste("Skipping code", cd, "- NA coefficients"))
+        rm(df_sub_train, df_sub_fore, df_ecm_train, model_cd)
+        next
+      }
+
+      # Extract coefficients explicitly
+      cf           <- coef(model_cd)
+      alpha        <- cf["(Intercept)"]
+      b_dlnl_lag   <- cf["dlnl_lag"]
+      gamma        <- cf["ec_term_lag"]
+      b_d_error_va <- cf["d_error_va"]
+      b_d_error_k  <- cf["d_error_k"]
+      b_dlnva      <- cf["dlnva"]
+      b_dlnk       <- cf["dlnk"]
+
+      # Anchor scalars from last training year
+      anchor        <- df_sub_train[df_sub_train$jaar == max(df_sub_train$jaar), ]
+      lnl_prev      <- anchor$lnl
+      dlnl_prev     <- anchor$dlnl
+      error_va_prev <- anchor$error_va
+      error_k_prev  <- anchor$error_k
+      ec_prev       <- anchor$ec_term2  # start from purged EC term
+
+      # Initialise forecast columns
+      df_sub_fore <- df_sub_fore %>% arrange(jaar)
+      df_sub_fore$pred_dlnl <- NA_real_
+      df_sub_fore$lnl       <- NA_real_
+
+      # ── Year-by-year scalar forecast ──────────────────────
+      for (i in seq_len(nrow(df_sub_fore))) {
+
+        row             <- df_sub_fore[i, ]
+        error_va_curr   <- row$error_va
+        error_k_curr    <- row$error_k
+        d_error_va_curr <- error_va_curr - error_va_prev
+        d_error_k_curr  <- error_k_curr  - error_k_prev
+
+        pred_dlnl <- alpha +
+          b_dlnl_lag   * dlnl_prev +
+          gamma        * ec_prev +
+          b_d_error_va * d_error_va_curr +
+          b_d_error_k  * d_error_k_curr +
+          b_dlnva      * row$dlnva +
+          b_dlnk       * row$dlnk
+
+        lnl_curr <- lnl_prev + pred_dlnl
+
+        df_sub_fore$pred_dlnl[i] <- pred_dlnl
+        df_sub_fore$lnl[i]       <- lnl_curr
+
+        # Update all scalars for next iteration
+        lnl_prev      <- lnl_curr
+        dlnl_prev     <- pred_dlnl
+        error_va_prev <- error_va_curr
+        error_k_prev  <- error_k_curr
+
+        # Update ec_prev using both step1 and step2 corrections
+        ec_raw  <- lnl_curr - predict(step1_y,  newdata = row)
+        ec_prev <- ec_raw   - predict(step2_ec, newdata = data.frame(
+          error_va = error_va_curr,
+          error_k  = error_k_curr
+        ))
+
+      } # end year loop
+
+      # Jensen correction + back-transform to levels
+      sigma2                    <- summary(model_cd)$sigma^2
+      df_sub_fore$lnl_corrected <- df_sub_fore$lnl + sigma2 / 2
+      df_sub_fore$L_forecast    <- exp(df_sub_fore$lnl_corrected)
+
+      results_list[[as.character(cd)]] <- df_sub_fore
+
+      rm(df_sub_train, df_sub_fore, df_ecm_train, model_cd,
+         cf, anchor, sigma2)
+
+    } # end inner loop (codes)
+
+    # Collect sector results
+    if (length(results_list) > 0) {
+      df_pred_seg <- bind_rows(df_pred_seg, bind_rows(results_list))
+    }
+
+    rm(df_sec, df_train, df_fore, codes,
+       step1_y, step1_va, step1_k,
+       step2_ec,                          # second-stage model
+       results_list)
+
+  } # end middle loop (sectors)
+
+  df_pred_all <- bind_rows(df_pred_all, df_pred_seg)
+  rm(df_seg, df_pred_seg, temp_sectors)
+
+} # end outer loop (segments)
+
+# ============================================================
+# PART 5 — VALIDATE OUTPUT
+# ============================================================
+
+cat("Total forecast rows:  ", nrow(df_pred_all), "\n")
+cat("Codes with forecasts: ", n_distinct(df_pred_all$code), "\n")
+cat("lnl range:            ", range(df_pred_all$lnl,        na.rm = TRUE), "\n")
+cat("pred_dlnl range:      ", range(df_pred_all$pred_dlnl,  na.rm = TRUE), "\n")
+cat("L_forecast range:     ", range(df_pred_all$L_forecast, na.rm = TRUE), "\n")
+cat("NAs in L_forecast:    ", sum(is.na(df_pred_all$L_forecast)), "\n")
