@@ -1,0 +1,22 @@
+# ── Reset accumulators right before the outer loop ──────────
+df_pred_all <- data.frame()   # ← must be here, just before for(seg in ...)
+
+for (seg in segments_loop) {
+
+  df_pred_seg <- data.frame()  # ← reset for each segment, inside outer loop
+
+  for (sec in temp_sectors) {
+
+    results_list <- list()     # ← reset for each sector, inside middle loop
+
+    for (cd in codes) {
+      ...
+      results_list[[cd]] <- df_sub_fore
+    }
+
+    if (length(results_list) > 0)
+      df_pred_seg <- dplyr::bind_rows(df_pred_seg, dplyr::bind_rows(results_list))
+  }
+
+  df_pred_all <- dplyr::bind_rows(df_pred_all, df_pred_seg)
+}
