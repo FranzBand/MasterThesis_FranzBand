@@ -1,0 +1,93 @@
+# ============================================================
+# COINTEGRATION SCREENING — ANNUAL DATA
+# Equation: lnl ~ lnk + lnva  (log_empl ~ log_investment + log_va)
+# Goal: flag which codes are cointegrated, for downstream DOLS/ECM
+# ============================================================
+
+library(urca)
+library(dplyr)
+
+data <- read.csv("data.csv")
+data <- subset(data, employment > 0 & investments > 0 & gdp > 0)
+
+data$lnl  <- log(data$employment)
+data$lnk  <- log(data$investments)
+data$lnva <- log(data$gdp)
+data$time <- data$year
+
+CV_5  <- -3.41
+CV_10 <- -3.12
+
+coint_label <- function(adf) {
+  ifelse(is.na(adf), "NA",
+  ifelse(adf < CV_5,  "YES (5%)",
+  ifelse(adf < CV_10, "YES (10%)", "NO")))
+}
+
+codes <- unique(data$code)
+cat("Total codes to screen:", length(codes), "\n")
+
+screen_results <- data.frame()
+
+for (cd in codes) {
+
+  sub <- data %>% filter(code == cd) %>% arrange(time)
+
+  valid <- is.finite(sub$lnl) & is.finite(sub$lnk) & is.finite(sub$lnva)
+  y  <- sub$lnl[valid]
+  x1 <- sub$lnk[valid]
+  x2 <- sub$lnva[valid]
+  n_valid <- length(y)
+
+  if (n_valid < 8 || sd(y) < 1e-10 || sd(x1) < 1e-10 || sd(x2) < 1e-10) {
+    screen_results <- rbind(screen_results, data.frame(
+      code = cd, n_obs = n_valid,
+      eg_coef_k = NA, eg_coef_va = NA,
+      eg_adf = NA, eg_coint = "SKIPPED (too short/no variation)"
+    ))
+    next
+  }
+
+  # --- Engle-Granger step 1: lnl ~ lnk + lnva -----------------
+  eg_fit <- tryCatch(lm(y ~ x1 + x2), error = function(e) NULL)
+
+  if (is.null(eg_fit)) {
+    screen_results <- rbind(screen_results, data.frame(
+      code = cd, n_obs = n_valid,
+      eg_coef_k = NA, eg_coef_va = NA,
+      eg_adf = NA, eg_coint = "ERROR (lm failed)"
+    ))
+    next
+  }
+
+  resid_eg <- residuals(eg_fit)
+  coefs    <- coef(eg_fit)
+
+  # --- Engle-Granger step 2: ADF on residuals -----------------
+  adf_t <- tryCatch(
+    ur.df(resid_eg, type = "none", selectlags = "AIC")@teststat[1],
+    error = function(e) NA
+  )
+
+  screen_results <- rbind(screen_results, data.frame(
+    code       = cd,
+    n_obs      = n_valid,
+    eg_coef_k  = round(coefs["x1"], 4),   # elasticity wrt lnk
+    eg_coef_va = round(coefs["x2"], 4),   # elasticity wrt lnva
+    eg_adf     = round(adf_t, 4),
+    eg_coint   = coint_label(adf_t)
+  ))
+}
+
+print(screen_results)
+write.csv(screen_results, "screening_cointegration_annual.csv", row.names = FALSE)
+
+# ------------------------------------------------------------
+# Codes flagged as cointegrated — feed into further DOLS/ECM tests
+# ------------------------------------------------------------
+cointegrated_codes <- screen_results %>%
+  filter(eg_coint %in% c("YES (5%)", "YES (10%)")) %>%
+  pull(code)
+
+cat("\nCointegrated codes (", length(cointegrated_codes), "):\n")
+print(cointegrated_codes)
